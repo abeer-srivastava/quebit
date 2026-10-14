@@ -121,3 +121,9 @@ func (s *Store) MarkFailedFinal(ctx context.Context, id uuid.UUID, msg string) e
 func (s *Store) ResetForRetry(ctx context.Context, id uuid.UUID) error {
 	return s.setStatus(ctx, id, StatusPending, nil)
 }
+
+// Delete removes a payment by ID. Used for test cleanup.
+func (s *Store) Delete(ctx context.Context, id uuid.UUID) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM payments WHERE id = $1`, id)
+	return err
+}

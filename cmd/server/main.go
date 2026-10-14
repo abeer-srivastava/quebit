@@ -69,10 +69,16 @@ func main() {
 	queueHandler := queue.NewHandler(store, providerCli, log)
 	queueHandler.Register(mux)
 
+	// Stale pending sweeper
+	sweeper := queue.NewSweeper(store, queueCli, log)
+
 	// HTTP server
 	httpMux := http.NewServeMux()
 	httpHandler := httpapi.NewHandler(store, queueCli, inspector, log)
 	httpHandler.RegisterRoutes(httpMux)
+
+	healthChecker := httpapi.NewHealthChecker(pool, rdb)
+	healthChecker.RegisterRoutes(httpMux)
 
 	rateLimiter := httpapi.NewRateLimiter(rdb, cfg.RateLimitRPS, time.Second)
 
@@ -105,6 +111,10 @@ func main() {
 			return fmt.Errorf("http server: %w", err)
 		}
 		return nil
+	})
+
+	g.Go(func() error {
+		return sweeper.Run(gctx)
 	})
 
 	// Graceful shutdown goroutine
