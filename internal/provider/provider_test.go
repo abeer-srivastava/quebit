@@ -2,6 +2,7 @@ package provider_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,18 +12,43 @@ import (
 
 func TestChargeSuccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"provider_ref": "ch_abc123"})
 	}))
 	defer srv.Close()
 
 	cli := provider.NewClient(srv.URL)
-	err := cli.Charge(context.Background(), provider.ChargeRequest{
+	result, err := cli.Charge(context.Background(), provider.ChargeRequest{
 		PaymentID: "test-123",
 		Amount:    5000,
 		Currency:  "USD",
 	})
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+	if result.ProviderRef != "ch_abc123" {
+		t.Fatalf("expected provider_ref=ch_abc123, got %s", result.ProviderRef)
+	}
+}
+
+func TestChargeSuccessEmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cli := provider.NewClient(srv.URL)
+	result, err := cli.Charge(context.Background(), provider.ChargeRequest{
+		PaymentID: "test-empty",
+		Amount:    1000,
+		Currency:  "USD",
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if result.ProviderRef != "" {
+		t.Fatalf("expected empty provider_ref, got %s", result.ProviderRef)
 	}
 }
 
@@ -34,7 +60,7 @@ func TestChargeRetryableError(t *testing.T) {
 	defer srv.Close()
 
 	cli := provider.NewClient(srv.URL)
-	err := cli.Charge(context.Background(), provider.ChargeRequest{
+	_, err := cli.Charge(context.Background(), provider.ChargeRequest{
 		PaymentID: "test-456",
 		Amount:    5000,
 		Currency:  "USD",
@@ -60,7 +86,7 @@ func TestChargeTerminalError(t *testing.T) {
 	defer srv.Close()
 
 	cli := provider.NewClient(srv.URL)
-	err := cli.Charge(context.Background(), provider.ChargeRequest{
+	_, err := cli.Charge(context.Background(), provider.ChargeRequest{
 		PaymentID: "test-789",
 		Amount:    5000,
 		Currency:  "USD",

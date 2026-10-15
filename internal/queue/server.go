@@ -1,7 +1,7 @@
 package queue
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"time"
 
 	"github.com/hibiken/asynq"
@@ -31,6 +31,7 @@ func exponentialBackoff(n int, _ error, _ *asynq.Task) time.Duration {
 	if d > 10*time.Minute {
 		d = 10 * time.Minute
 	}
-	jitter := time.Duration(rand.Int63n(int64(d)/5 + 1))
+	jitter := time.Duration(rand.Int64N(int64(d)/5 + 1))
 	return d + jitter
 }
+

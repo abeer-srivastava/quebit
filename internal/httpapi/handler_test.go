@@ -4,21 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
-	"io"
-	"log/slog"
-
+	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abeer-srivastava/quebit/internal/httpapi"
 	"github.com/abeer-srivastava/quebit/internal/payment"
+	"github.com/abeer-srivastava/quebit/internal/provider"
 	"github.com/abeer-srivastava/quebit/internal/queue"
-
-	"github.com/hibiken/asynq"
+	"github.com/abeer-srivastava/quebit/internal/service"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -51,7 +51,9 @@ func setupHandler(t *testing.T) (*httpapi.Handler, *payment.Store) {
 	})
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := httpapi.NewHandler(store, queueCli, inspector, log)
+	providerCli := provider.NewClient("http://localhost:9090")
+	svc := service.New(store, queueCli, inspector, providerCli, log)
+	h := httpapi.NewHandler(svc, log)
 	return h, store
 }
 
@@ -66,20 +68,24 @@ func TestCreatePaymentAPI(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	// Now returns 202 Accepted instead of 201 Created
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var p payment.Payment
-	json.NewDecoder(rec.Body).Decode(&p)
+	var resp httpapi.CreateResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
 
-	if p.Amount != 5000 || p.Currency != "USD" || p.Status != payment.StatusPending {
-		t.Fatalf("unexpected payment: %+v", p)
+	if resp.Payment.Amount != 5000 || resp.Payment.Currency != "USD" || resp.Payment.Status != payment.StatusPending {
+		t.Fatalf("unexpected payment: %+v", resp.Payment)
+	}
+	if !resp.Created {
+		t.Fatal("expected created=true")
 	}
 
 	// Cleanup
 	t.Cleanup(func() {
-		store.Delete(context.Background(), p.ID)
+		store.Delete(context.Background(), resp.Payment.ID)
 	})
 }
 
@@ -96,11 +102,11 @@ func TestCreatePaymentIdempotent(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("first: expected 201, got %d", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("first: expected 202, got %d", rec.Code)
 	}
 
-	var first payment.Payment
+	var first httpapi.CreateResponse
 	json.NewDecoder(rec.Body).Decode(&first)
 
 	// Second request with same idempotency key
@@ -112,15 +118,18 @@ func TestCreatePaymentIdempotent(t *testing.T) {
 		t.Fatalf("second: expected 200, got %d", rec.Code)
 	}
 
-	var second payment.Payment
+	var second httpapi.CreateResponse
 	json.NewDecoder(rec.Body).Decode(&second)
 
-	if first.ID != second.ID {
-		t.Fatalf("idempotency broken: first=%s second=%s", first.ID, second.ID)
+	if first.Payment.ID != second.Payment.ID {
+		t.Fatalf("idempotency broken: first=%s second=%s", first.Payment.ID, second.Payment.ID)
+	}
+	if second.Created {
+		t.Fatal("expected created=false for idempotent replay")
 	}
 
 	t.Cleanup(func() {
-		store.Delete(context.Background(), first.ID)
+		store.Delete(context.Background(), first.Payment.ID)
 	})
 }
 

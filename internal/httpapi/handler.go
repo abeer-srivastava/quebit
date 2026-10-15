@@ -9,18 +9,17 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/abeer-srivastava/quebit/internal/payment"
-	"github.com/abeer-srivastava/quebit/internal/queue"
+	"github.com/abeer-srivastava/quebit/internal/service"
 )
 
+// Handler is a thin HTTP adapter that delegates business logic to service.Service.
 type Handler struct {
-	store     *payment.Store
-	queueCli  *queue.Client
-	inspector *queue.Inspector
-	log       *slog.Logger
+	svc *service.Service
+	log *slog.Logger
 }
 
-func NewHandler(s *payment.Store, q *queue.Client, insp *queue.Inspector, l *slog.Logger) *Handler {
-	return &Handler{store: s, queueCli: q, inspector: insp, log: l}
+func NewHandler(svc *service.Service, l *slog.Logger) *Handler {
+	return &Handler{svc: svc, log: l}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -35,115 +34,112 @@ type CreateRequest struct {
 	Currency       string `json:"currency"`
 }
 
+// CreateResponse wraps the payment with metadata about what happened.
+type CreateResponse struct {
+	Payment  *payment.Payment `json:"payment"`
+	Created  bool             `json:"created"`
+	Enqueued bool             `json:"enqueued"`
+}
+
+// GetResponse wraps the payment for consistency.
+type GetResponse struct {
+	Payment *payment.Payment `json:"payment"`
+}
+
+// RetryResponse wraps the retry outcome.
+type RetryResponse struct {
+	Status string `json:"status"`
+}
+
 func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	var req CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeError(w, http.StatusBadRequest, ErrInvalidJSON)
 		return
 	}
 
-	if req.IdempotencyKey == "" || req.Amount <= 0 || req.Currency == "" {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-			"error": "idempotency_key, amount (>0), and currency are required",
-		})
+	// Validate required fields
+	if req.IdempotencyKey == "" {
+		writeError(w, http.StatusUnprocessableEntity,
+			validationError("idempotency_key", "idempotency_key is required"))
+		return
+	}
+	if req.Amount <= 0 {
+		writeError(w, http.StatusUnprocessableEntity,
+			validationError("amount", "amount must be greater than 0"))
+		return
+	}
+	if req.Currency == "" {
+		writeError(w, http.StatusUnprocessableEntity,
+			validationError("currency", "currency is required"))
 		return
 	}
 
-	p := &payment.Payment{
-		ID:             uuid.New(),
-		IdempotencyKey: req.IdempotencyKey,
-		Amount:         req.Amount,
-		Currency:       req.Currency,
-	}
-
-	created, isNew, err := h.store.Create(r.Context(), p)
+	result, err := h.svc.CreatePayment(r.Context(), req.IdempotencyKey, req.Amount, req.Currency)
 	if err != nil {
 		h.log.Error("failed to create payment", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		writeError(w, http.StatusInternalServerError, ErrInternal)
 		return
 	}
 
-	if isNew {
-		if err := h.queueCli.EnqueueProcess(r.Context(), created.ID, created.Amount); err != nil {
-			h.log.Error("failed to enqueue payment", "id", created.ID, "err", err)
-			// Payment exists in DB as pending — a sweeper or manual retry can pick it up
-		}
-	}
-
-	status := http.StatusCreated
-	if !isNew {
+	// 202 Accepted for new payments (accepted for async processing)
+	// 200 OK for idempotent replays
+	status := http.StatusAccepted
+	if !result.Created {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, created)
+
+	writeJSON(w, status, CreateResponse{
+		Payment:  result.Payment,
+		Created:  result.Created,
+		Enqueued: result.Enqueued,
+	})
 }
 
 func (h *Handler) GetPayment(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid uuid"})
+		writeError(w, http.StatusBadRequest, ErrBadUUID)
 		return
 	}
 
-	p, err := h.store.Get(r.Context(), id)
+	p, err := h.svc.GetPayment(r.Context(), id)
 	if errors.Is(err, payment.ErrNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		writeError(w, http.StatusNotFound, ErrNotFound)
 		return
 	}
 	if err != nil {
 		h.log.Error("failed to get payment", "id", id, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		writeError(w, http.StatusInternalServerError, ErrInternal)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(w, http.StatusOK, GetResponse{Payment: p})
 }
 
 func (h *Handler) RetryPayment(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid uuid"})
+		writeError(w, http.StatusBadRequest, ErrBadUUID)
 		return
 	}
 
-	p, err := h.store.Get(r.Context(), id)
+	err = h.svc.RetryPayment(r.Context(), id)
 	if errors.Is(err, payment.ErrNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		writeError(w, http.StatusNotFound, ErrNotFound)
+		return
+	}
+	if errors.Is(err, service.ErrNotRetryable) {
+		writeError(w, http.StatusConflict, conflictError("only failed_final payments can be retried"))
 		return
 	}
 	if err != nil {
-		h.log.Error("failed to get payment", "id", id, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		h.log.Error("failed to retry payment", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, ErrInternal)
 		return
 	}
 
-	if p.Status != payment.StatusFailedFinal {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "only failed_final payments can be retried",
-		})
-		return
-	}
-
-	// Try to replay the archived task via Asynq Inspector
-	if err := h.inspector.ReplayArchivedTask(id.String()); err != nil {
-		h.log.Warn("inspector replay failed, re-enqueuing fresh task", "id", id, "err", err)
-		// Fallback: reset state and enqueue a fresh task
-		if err := h.store.ResetForRetry(r.Context(), id); err != nil {
-			h.log.Error("failed to reset payment", "id", id, "err", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		if err := h.queueCli.EnqueueProcess(r.Context(), id, p.Amount); err != nil {
-			h.log.Error("failed to re-enqueue payment", "id", id, "err", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-	} else {
-		if err := h.store.ResetForRetry(r.Context(), id); err != nil {
-			h.log.Error("failed to reset payment", "id", id, "err", err)
-		}
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "retrying"})
+	writeJSON(w, http.StatusAccepted, RetryResponse{Status: "retrying"})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -1,11 +1,15 @@
 # Binaries
-payflow
+quebit
+bin/
 *.exe
 
 # IDE
 .idea/
 .vscode/
 *.swp
+
+# Env
+.env
 
 # OS
 .DS_Store

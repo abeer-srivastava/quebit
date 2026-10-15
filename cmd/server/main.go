@@ -13,6 +13,7 @@ import (
 
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
@@ -20,9 +21,13 @@ import (
 	"github.com/abeer-srivastava/quebit/internal/payment"
 	"github.com/abeer-srivastava/quebit/internal/provider"
 	"github.com/abeer-srivastava/quebit/internal/queue"
+	"github.com/abeer-srivastava/quebit/internal/service"
 )
 
 func main() {
+	// Load .env file if present (ignore error if not found)
+	_ = godotenv.Load()
+
 	log := setupLogger()
 
 	cfg := loadConfig()
@@ -63,10 +68,13 @@ func main() {
 	inspector := queue.NewInspector(redisOpt)
 	defer inspector.Close()
 
+	// Service layer — single point of business logic
+	svc := service.New(store, queueCli, inspector, providerCli, log)
+
 	// Asynq worker
 	asynqServer := queue.NewServer(redisOpt, cfg.WorkerConcurrency)
 	mux := asynq.NewServeMux()
-	queueHandler := queue.NewHandler(store, providerCli, log)
+	queueHandler := queue.NewHandler(svc, log)
 	queueHandler.Register(mux)
 
 	// Stale pending sweeper
@@ -74,7 +82,7 @@ func main() {
 
 	// HTTP server
 	httpMux := http.NewServeMux()
-	httpHandler := httpapi.NewHandler(store, queueCli, inspector, log)
+	httpHandler := httpapi.NewHandler(svc, log)
 	httpHandler.RegisterRoutes(httpMux)
 
 	healthChecker := httpapi.NewHealthChecker(pool, rdb)
@@ -153,7 +161,7 @@ type config struct {
 
 func loadConfig() config {
 	return config{
-		DatabaseURL:       envOr("DATABASE_URL", "postgres://payflow:payflow@localhost:5432/payflow?sslmode=disable"),
+		DatabaseURL:       envOr("DATABASE_URL", "postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable"),
 		RedisAddr:         envOr("REDIS_ADDR", "localhost:6379"),
 		HTTPAddr:          envOr("HTTP_ADDR", ":8080"),
 		ProviderURL:       envOr("PROVIDER_URL", "http://localhost:9090"),

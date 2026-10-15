@@ -1,0 +1,81 @@
+# Quebit API Test Collection
+# Use with VS Code REST Client extension or similar HTTP client tools.
+# Variables can be overridden per-environment.
+
+@host = http://localhost:8080
+
+### Health Check
+GET {{host}}/healthz
+
+### Create Payment
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{
+  "idempotency_key": "order-12345",
+  "amount": 5000,
+  "currency": "USD"
+}
+
+### Create Payment (idempotent replay — same key)
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{
+  "idempotency_key": "order-12345",
+  "amount": 5000,
+  "currency": "USD"
+}
+
+### Create Payment (high value — routes to critical queue)
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{
+  "idempotency_key": "order-99999",
+  "amount": 50000,
+  "currency": "EUR"
+}
+
+### Create Payment (low value — routes to low queue)
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{
+  "idempotency_key": "order-small-1",
+  "amount": 500,
+  "currency": "GBP"
+}
+
+### Get Payment by ID
+# Replace the UUID with an actual payment ID from a create response
+GET {{host}}/v1/payments/00000000-0000-0000-0000-000000000001
+
+### Retry Failed Payment
+# Replace the UUID with an actual payment ID that is in failed_final state
+POST {{host}}/v1/payments/00000000-0000-0000-0000-000000000001/retry
+
+### Validation Error — Missing fields
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{}
+
+### Validation Error — Negative amount
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{
+  "idempotency_key": "bad-amount",
+  "amount": -100,
+  "currency": "USD"
+}
+
+### Bad Request — Invalid JSON
+POST {{host}}/v1/payments
+Content-Type: application/json
+
+{this is not valid json}
+
+### Not Found — Bad UUID
+GET {{host}}/v1/payments/not-a-uuid

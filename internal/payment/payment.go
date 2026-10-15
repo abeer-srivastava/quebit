@@ -24,6 +24,7 @@ type Payment struct {
 	Status         Status    `json:"status"`
 	Attempts       int       `json:"attempts"`
 	LastError      *string   `json:"last_error,omitempty"`
+	ProviderRef    *string   `json:"provider_ref,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }

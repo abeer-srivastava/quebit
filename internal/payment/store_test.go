@@ -144,7 +144,7 @@ func TestClaimAndTerminalGuard(t *testing.T) {
 	}
 
 	// Mark as succeeded
-	if err := store.MarkSucceeded(ctx, id); err != nil {
+	if err := store.MarkSucceeded(ctx, id, "test-provider-ref-123"); err != nil {
 		t.Fatalf("mark succeeded: %v", err)
 	}
 

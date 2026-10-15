@@ -11,14 +11,14 @@ import (
 // Sweeper periodically re-enqueues payments stuck in "pending" state.
 // This handles the gap where a DB insert succeeded but the Redis enqueue failed.
 type Sweeper struct {
-	store    *payment.Store
-	client   *Client
+	store    payment.StaleFinder
+	client   Enqueuer
 	interval time.Duration
 	staleAge int // seconds a payment must be pending before it's considered stale
 	log      *slog.Logger
 }
 
-func NewSweeper(store *payment.Store, client *Client, log *slog.Logger) *Sweeper {
+func NewSweeper(store payment.StaleFinder, client Enqueuer, log *slog.Logger) *Sweeper {
 	return &Sweeper{
 		store:    store,
 		client:   client,

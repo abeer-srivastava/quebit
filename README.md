@@ -68,7 +68,7 @@ curl http://localhost:8080/healthz
 ## API
 
 ### `POST /v1/payments`
-Create a new payment. Returns `201` for new, `200` for idempotent duplicate.
+Create a new payment. Returns `202 Accepted` for new (accepted for async processing), `200` for idempotent duplicate.
 
 ```json
 {
@@ -94,7 +94,7 @@ Health check. Returns `200` if both Postgres and Redis are reachable, `503` othe
 go test ./internal/provider/ ./internal/queue/
 
 # Integration tests (needs Postgres running)
-DATABASE_URL=postgres://payflow:payflow@localhost:5432/payflow?sslmode=disable \
+DATABASE_URL=postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable \
   go test -v ./...
 ```
 

@@ -22,13 +22,13 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-const cols = `id, idempotency_key, amount, currency, status, attempts, last_error, created_at, updated_at`
+const cols = `id, idempotency_key, amount, currency, status, attempts, last_error, provider_ref, created_at, updated_at`
 
 func scan(row pgx.Row) (*Payment, error) {
 	var p Payment
 	err := row.Scan(
 		&p.ID, &p.IdempotencyKey, &p.Amount, &p.Currency,
-		&p.Status, &p.Attempts, &p.LastError, &p.CreatedAt, &p.UpdatedAt,
+		&p.Status, &p.Attempts, &p.LastError, &p.ProviderRef, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -96,30 +96,30 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID) (*Payment, error) {
 	return p, err
 }
 
-func (s *Store) setStatus(ctx context.Context, id uuid.UUID, st Status, errMsg *string) error {
+func (s *Store) setStatus(ctx context.Context, id uuid.UUID, st Status, errMsg *string, providerRef *string) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE payments SET status = $2, last_error = $3, updated_at = now() WHERE id = $1`,
-		id, st, errMsg,
+		`UPDATE payments SET status = $2, last_error = $3, provider_ref = COALESCE($4, provider_ref), updated_at = now() WHERE id = $1`,
+		id, st, errMsg, providerRef,
 	)
 	return err
 }
 
-func (s *Store) MarkSucceeded(ctx context.Context, id uuid.UUID) error {
-	return s.setStatus(ctx, id, StatusSucceeded, nil)
+func (s *Store) MarkSucceeded(ctx context.Context, id uuid.UUID, providerRef string) error {
+	return s.setStatus(ctx, id, StatusSucceeded, nil, &providerRef)
 }
 
 func (s *Store) MarkRetrying(ctx context.Context, id uuid.UUID, msg string) error {
-	return s.setStatus(ctx, id, StatusRetrying, &msg)
+	return s.setStatus(ctx, id, StatusRetrying, &msg, nil)
 }
 
 func (s *Store) MarkFailedFinal(ctx context.Context, id uuid.UUID, msg string) error {
-	return s.setStatus(ctx, id, StatusFailedFinal, &msg)
+	return s.setStatus(ctx, id, StatusFailedFinal, &msg, nil)
 }
 
 // ResetForRetry is used by the manual replay endpoint to put a
 // failed_final payment back into pending so it can be re-enqueued.
 func (s *Store) ResetForRetry(ctx context.Context, id uuid.UUID) error {
-	return s.setStatus(ctx, id, StatusPending, nil)
+	return s.setStatus(ctx, id, StatusPending, nil, nil)
 }
 
 // Delete removes a payment by ID. Used for test cleanup.

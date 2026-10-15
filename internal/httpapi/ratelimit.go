@@ -9,6 +9,41 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// luaRateLimit is an atomic sliding-window rate limiter implemented as a Lua script.
+// It runs entirely within Redis, eliminating the race condition of a pipeline approach
+// where ZREMRANGEBYSCORE + ZCARD + ZADD execute as separate commands.
+//
+// The script atomically:
+// 1. Removes entries outside the time window
+// 2. Counts remaining entries
+// 3. If under limit, adds the new request
+// 4. Sets an expiry so keys don't leak
+// Returns 1 if allowed, 0 if rate limited.
+var luaRateLimit = redis.NewScript(`
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window_ns = tonumber(ARGV[2])
+local now_ns = tonumber(ARGV[3])
+local window_start = now_ns - window_ns
+
+-- Remove entries outside the window
+redis.call('ZREMRANGEBYSCORE', key, '0', tostring(window_start))
+
+-- Count entries in current window
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+    -- Under limit: add the request and set expiry
+    redis.call('ZADD', key, now_ns, tostring(now_ns))
+    redis.call('PEXPIRE', key, math.ceil(window_ns / 1000000) + 1000)
+    return 1
+else
+    -- Over limit: set expiry but don't add
+    redis.call('PEXPIRE', key, math.ceil(window_ns / 1000000) + 1000)
+    return 0
+end
+`)
+
 type RateLimiter struct {
 	rdb    *redis.Client
 	limit  int
@@ -20,35 +55,21 @@ func NewRateLimiter(rdb *redis.Client, limit int, window time.Duration) *RateLim
 }
 
 // Allow checks if the given key (e.g. client IP) is within the rate limit
-// using a Redis sorted set sliding window.
+// using an atomic Redis Lua script with a sliding window.
 func (rl *RateLimiter) Allow(ctx context.Context, key string) (bool, error) {
 	now := time.Now()
-	windowStart := now.Add(-rl.window)
 	redisKey := fmt.Sprintf("ratelimit:%s", key)
 
-	pipe := rl.rdb.Pipeline()
-
-	// Remove entries outside the window
-	pipe.ZRemRangeByScore(ctx, redisKey, "0", fmt.Sprintf("%d", windowStart.UnixNano()))
-
-	// Count entries in the current window
-	countCmd := pipe.ZCard(ctx, redisKey)
-
-	// Add current request
-	pipe.ZAdd(ctx, redisKey, redis.Z{
-		Score:  float64(now.UnixNano()),
-		Member: fmt.Sprintf("%d", now.UnixNano()),
-	})
-
-	// Set expiry so keys don't leak
-	pipe.Expire(ctx, redisKey, rl.window+time.Second)
-
-	_, err := pipe.Exec(ctx)
+	result, err := luaRateLimit.Run(ctx, rl.rdb, []string{redisKey},
+		rl.limit,
+		rl.window.Nanoseconds(),
+		now.UnixNano(),
+	).Int()
 	if err != nil {
 		return false, err
 	}
 
-	return countCmd.Val() < int64(rl.limit), nil
+	return result == 1, nil
 }
 
 // Middleware returns an HTTP middleware that rate limits by client IP.
@@ -65,7 +86,8 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		if !allowed {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(rl.window.Seconds())))
-			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+			writeError(w, http.StatusTooManyRequests,
+				&APIError{Code: "rate_limited", Message: "rate limit exceeded"})
 			return
 		}
 

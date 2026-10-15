@@ -2,9 +2,9 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: payflow
-      POSTGRES_PASSWORD: payflow
-      POSTGRES_DB: payflow
+      POSTGRES_USER: quebit
+      POSTGRES_PASSWORD: quebit
+      POSTGRES_DB: quebit
     ports:
       - "5432:5432"
     volumes:

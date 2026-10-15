@@ -16,6 +16,11 @@ type ChargeRequest struct {
 	Currency  string `json:"currency"`
 }
 
+// chargeResponse is the expected JSON body from a successful provider charge.
+type chargeResponse struct {
+	ProviderRef string `json:"provider_ref"`
+}
+
 type Error struct {
 	StatusCode int
 	Body       string
@@ -43,26 +48,35 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-func (c *Client) Charge(ctx context.Context, req ChargeRequest) error {
+// Charge calls the external payment provider and returns a ChargeResult with the
+// provider's reference ID on success.
+func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResult, error) {
 	body, _ := json.Marshal(req)
 
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/charge", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Idempotency-Key", req.PaymentID)
 
 	resp, err := c.http.Do(r)
 	if err != nil {
-		return err // network errors are treated as retryable by the handler
+		return nil, err // network errors are treated as retryable by the handler
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode/100 == 2 {
-		return nil
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+
+	if resp.StatusCode/100 != 2 {
+		return nil, &Error{StatusCode: resp.StatusCode, Body: string(b)}
 	}
 
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return &Error{StatusCode: resp.StatusCode, Body: string(b)}
+	// Parse provider response for the reference ID
+	var cr chargeResponse
+	if err := json.Unmarshal(b, &cr); err != nil {
+		// Provider returned 2xx but didn't include a parseable body — use empty ref
+		return &ChargeResult{ProviderRef: ""}, nil
+	}
+	return &ChargeResult{ProviderRef: cr.ProviderRef}, nil
 }
