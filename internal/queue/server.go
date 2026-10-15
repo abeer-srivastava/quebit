@@ -34,4 +34,3 @@ func exponentialBackoff(n int, _ error, _ *asynq.Task) time.Duration {
 	jitter := time.Duration(rand.Int64N(int64(d)/5 + 1))
 	return d + jitter
 }
-

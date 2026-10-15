@@ -63,6 +63,7 @@ func main() {
 	// Dependencies
 	store := payment.NewStore(pool)
 	providerCli := provider.NewClient(cfg.ProviderURL)
+	providerCli.APIKey = cfg.ProviderAPIKey
 	queueCli := queue.NewClient(redisOpt)
 	defer queueCli.Close()
 	inspector := queue.NewInspector(redisOpt)
@@ -133,13 +134,13 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		asynqServer.Shutdown()
-		log.Info("asynq worker stopped")
-
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("http shutdown: %w", err)
 		}
 		log.Info("http server stopped")
+
+		asynqServer.Shutdown()
+		log.Info("asynq worker stopped")
 		return nil
 	})
 
@@ -155,6 +156,7 @@ type config struct {
 	RedisAddr         string
 	HTTPAddr          string
 	ProviderURL       string
+	ProviderAPIKey    string
 	WorkerConcurrency int
 	RateLimitRPS      int
 }
@@ -165,6 +167,7 @@ func loadConfig() config {
 		RedisAddr:         envOr("REDIS_ADDR", "localhost:6379"),
 		HTTPAddr:          envOr("HTTP_ADDR", ":8080"),
 		ProviderURL:       envOr("PROVIDER_URL", "http://localhost:9090"),
+		ProviderAPIKey:    envOr("PROVIDER_API_KEY", ""),
 		WorkerConcurrency: 10,
 		RateLimitRPS:      100,
 	}

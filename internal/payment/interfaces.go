@@ -17,6 +17,7 @@ type Repository interface {
 	MarkRetrying(ctx context.Context, id uuid.UUID, msg string) error
 	MarkFailedFinal(ctx context.Context, id uuid.UUID, msg string) error
 	ResetForRetry(ctx context.Context, id uuid.UUID) error
+	Delete(ctx context.Context, id uuid.UUID) error
 }
 
 // StaleFinder finds payments stuck in pending state. Separated from Repository

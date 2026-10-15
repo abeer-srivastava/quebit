@@ -37,6 +37,9 @@ HTTP Request → Rate Limiter → Handler → Postgres (create) → Redis/Asynq 
 # Start Postgres and Redis
 docker compose up -d
 
+# Start the mock payment provider (separate terminal)
+go run ./cmd/mockprovider
+
 # Run the server
 LOG_LEVEL=DEBUG go run ./cmd/server
 
@@ -59,10 +62,11 @@ curl http://localhost:8080/healthz
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | `postgres://payflow:payflow@localhost:5432/payflow?sslmode=disable` | Postgres connection string |
+| `DATABASE_URL` | `postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable` | Postgres connection string |
 | `REDIS_ADDR` | `localhost:6379` | Redis address |
 | `HTTP_ADDR` | `:8080` | HTTP listen address |
 | `PROVIDER_URL` | `http://localhost:9090` | External payment provider base URL |
+| `PROVIDER_API_KEY` | *(empty)* | Optional bearer token sent to the provider |
 | `LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARN`, `ERROR` |
 
 ## API
@@ -105,7 +109,9 @@ cmd/server/main.go           — entry point, wiring, graceful shutdown
 internal/payment/payment.go   — Payment model and status constants
 internal/payment/store.go     — Postgres store (CRUD, Claim, idempotency)
 internal/payment/sweeper.go   — stale pending query
-internal/provider/provider.go — external provider HTTP client
+internal/provider/provider.go     — external provider HTTP client
+internal/provider/mock.go         — in-memory mock provider (tests/dev)
+cmd/mockprovider/main.go         — runnable fake provider for local dev
 internal/queue/tasks.go       — task types, queue routing, Asynq client
 internal/queue/server.go      — Asynq server factory with backoff
 internal/queue/handler.go     — task handler (claim → charge → mark)
@@ -117,3 +123,16 @@ internal/httpapi/logger.go    — request logger middleware
 internal/httpapi/health.go    — health check endpoint
 migrations/001_init.sql       — database schema
 ```
+
+## Improvements in this revision
+
+- `migrations/001_init.sql` now includes `provider_ref`, preventing `column "provider_ref" does not exist` on fresh databases.
+- CI applies all SQL migrations in `migrations/` in order.
+- `payment.Repository` now declares `Delete`, matching the store implementation.
+- Rate limiter recognises `X-Forwarded-For` / `X-Real-IP` for proxy-aware limiting.
+- HTTP request bodies are capped at 1 MiB via `http.MaxBytesReader`.
+- `CreatePayment` validates idempotency key length.
+- Every response carries an `X-Request-ID`, and request logs include it.
+- Provider client supports an optional bearer token (`PROVIDER_API_KEY`).
+- Graceful shutdown now drains HTTP before the Asynq worker.
+- A runnable mock provider (`cmd/mockprovider`) and an in-memory `MockCharger` simplify local development and tests.

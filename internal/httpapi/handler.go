@@ -52,6 +52,8 @@ type RetryResponse struct {
 }
 
 func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB request body limit
+
 	var req CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, ErrInvalidJSON)
@@ -62,6 +64,11 @@ func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	if req.IdempotencyKey == "" {
 		writeError(w, http.StatusUnprocessableEntity,
 			validationError("idempotency_key", "idempotency_key is required"))
+		return
+	}
+	if len(req.IdempotencyKey) > 255 {
+		writeError(w, http.StatusUnprocessableEntity,
+			validationError("idempotency_key", "idempotency_key must be at most 255 characters"))
 		return
 	}
 	if req.Amount <= 0 {

@@ -38,6 +38,7 @@ func (e *Error) Retryable() bool {
 
 type Client struct {
 	baseURL string
+	APIKey  string
 	http    *http.Client
 }
 
@@ -59,6 +60,9 @@ func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResult, 
 	}
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Idempotency-Key", req.PaymentID)
+	if c.APIKey != "" {
+		r.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
 
 	resp, err := c.http.Do(r)
 	if err != nil {

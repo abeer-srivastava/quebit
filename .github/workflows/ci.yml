@@ -33,7 +33,10 @@ jobs:
           go-version: "1.26"
 
       - name: Apply migrations
-        run: psql "$DATABASE_URL" -f migrations/001_init.sql
+        run: |
+          for f in migrations/*.sql; do
+            psql "$DATABASE_URL" -f "$f"
+          done
         env:
           DATABASE_URL: postgres://payflow:payflow@localhost:5432/payflow?sslmode=disable
 

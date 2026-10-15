@@ -4,10 +4,28 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// clientIP extracts the originating client IP, honouring common proxy headers
+// when present. Falls back to RemoteAddr.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			xff = xff[:i]
+		}
+		if ip := strings.TrimSpace(xff); ip != "" {
+			return ip
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		return xri
+	}
+	return r.RemoteAddr
+}
 
 // luaRateLimit is an atomic sliding-window rate limiter implemented as a Lua script.
 // It runs entirely within Redis, eliminating the race condition of a pipeline approach
@@ -75,7 +93,7 @@ func (rl *RateLimiter) Allow(ctx context.Context, key string) (bool, error) {
 // Middleware returns an HTTP middleware that rate limits by client IP.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.RemoteAddr
+		key := clientIP(r)
 
 		allowed, err := rl.Allow(r.Context(), key)
 		if err != nil {
