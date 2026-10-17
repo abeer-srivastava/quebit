@@ -41,8 +41,7 @@ jobs:
           done
           # Guard against silent schema drift: fail loudly if the columns the
           # tests rely on are missing.
-          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
-            -c "SELECT id, idempotency_key, provider_ref FROM payments LIMIT 0;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "SELECT id, idempotency_key, amount, currency, status, attempts, last_error, provider_ref, created_at, updated_at, locked_until, request_hash, published_at FROM payments LIMIT 0;"
         env:
           DATABASE_URL: postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable
 
