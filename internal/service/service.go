@@ -90,31 +90,22 @@ func (s *Service) GetPayment(ctx context.Context, id uuid.UUID) (*payment.Paymen
 	return s.store.Get(ctx, id)
 }
 
-// RetryPayment replays a failed_final payment. It first tries to replay
-// the archived Asynq task; if that fails, it resets the status and enqueues fresh.
+// RetryPayment replays a failed_final payment. The transition back to pending
+// is atomic, so concurrent retries cannot both succeed. It then prefers
+// replaying the archived Asynq task and falls back to a fresh enqueue.
 func (s *Service) RetryPayment(ctx context.Context, id uuid.UUID) error {
-	p, err := s.store.Get(ctx, id)
+	// Atomically claim the retry: only one concurrent caller can move
+	// failed_final → pending.
+	p, err := s.store.ResetForRetry(ctx, id)
 	if err != nil {
-		return err
+		return err // ErrNotFound | ErrNotRetryable | DB error
 	}
 
-	if p.Status != payment.StatusFailedFinal {
-		return ErrNotRetryable
-	}
-
-	// Try to replay the archived task via Asynq Inspector
+	// Try to replay the archived task via the Asynq Inspector.
 	if err := s.replayer.ReplayArchivedTask(id.String()); err != nil {
 		s.log.Warn("inspector replay failed, re-enqueuing fresh task", "id", id, "err", err)
-		// Fallback: reset state and enqueue a fresh task
-		if err := s.store.ResetForRetry(ctx, id); err != nil {
-			return fmt.Errorf("reset for retry: %w", err)
-		}
 		if err := s.queue.EnqueueProcess(ctx, id, p.Amount); err != nil {
 			return fmt.Errorf("re-enqueue: %w", err)
-		}
-	} else {
-		if err := s.store.ResetForRetry(ctx, id); err != nil {
-			s.log.Error("failed to reset payment after replay", "id", id, "err", err)
 		}
 	}
 
@@ -170,6 +161,3 @@ func (s *Service) MarkExhausted(ctx context.Context, id uuid.UUID, reason string
 	s.log.Warn("retry budget exhausted, marking failed_final", "id", id, "reason", reason)
 	return s.store.MarkFailedFinal(ctx, id, reason)
 }
-
-// ErrNotRetryable is returned when trying to retry a payment that isn't in failed_final state.
-var ErrNotRetryable = errors.New("only failed_final payments can be retried")

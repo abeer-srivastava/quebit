@@ -16,7 +16,7 @@ type Repository interface {
 	MarkSucceeded(ctx context.Context, id uuid.UUID, providerRef string) error
 	MarkRetrying(ctx context.Context, id uuid.UUID, msg string) error
 	MarkFailedFinal(ctx context.Context, id uuid.UUID, msg string) error
-	ResetForRetry(ctx context.Context, id uuid.UUID) error
+	ResetForRetry(ctx context.Context, id uuid.UUID) (*Payment, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 

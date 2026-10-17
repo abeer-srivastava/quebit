@@ -126,7 +126,7 @@ func (h *Handler) RetryPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, ErrNotFound)
 		return
 	}
-	if errors.Is(err, service.ErrNotRetryable) {
+	if errors.Is(err, payment.ErrNotRetryable) {
 		writeError(w, http.StatusConflict, conflictError("only failed_final payments can be retried"))
 		return
 	}

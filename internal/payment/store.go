@@ -13,6 +13,9 @@ import (
 var (
 	ErrNotFound    = errors.New("payment not found")
 	ErrAlreadyDone = errors.New("payment already in terminal state")
+	// ErrNotRetryable is returned when a manual retry targets a payment that is
+	// not in the failed_final state.
+	ErrNotRetryable = errors.New("only failed_final payments can be retried")
 )
 
 // DefaultProcessingLease is how long a worker may hold a payment in the
@@ -144,10 +147,33 @@ func (s *Store) MarkFailedFinal(ctx context.Context, id uuid.UUID, msg string) e
 	return s.setStatus(ctx, id, StatusFailedFinal, &msg, nil)
 }
 
-// ResetForRetry is used by the manual replay endpoint to put a
-// failed_final payment back into pending so it can be re-enqueued.
-func (s *Store) ResetForRetry(ctx context.Context, id uuid.UUID) error {
-	return s.setStatus(ctx, id, StatusPending, nil, nil)
+// ResetForRetry atomically moves a failed_final payment back to pending and
+// returns the updated row, so it can be re-enqueued.
+//
+// The state check is part of the UPDATE, not a separate read: two concurrent
+// retry requests cannot both succeed, because only one can observe
+// status='failed_final'. Returns ErrNotFound if the payment does not exist and
+// ErrNotRetryable if it is not in failed_final.
+func (s *Store) ResetForRetry(ctx context.Context, id uuid.UUID) (*Payment, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE payments
+		SET status = 'pending', last_error = NULL, locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND status = 'failed_final'
+		RETURNING `+cols,
+		id,
+	)
+	p, err := scan(row)
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	// No row transitioned: distinguish "missing" from "wrong state".
+	if _, gerr := s.Get(ctx, id); gerr != nil {
+		return nil, gerr
+	}
+	return nil, ErrNotRetryable
 }
 
 // Delete removes a payment by ID. Used for test cleanup.
