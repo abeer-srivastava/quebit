@@ -157,7 +157,7 @@ func (s *Store) MarkFailedFinal(ctx context.Context, id uuid.UUID, msg string) e
 func (s *Store) ResetForRetry(ctx context.Context, id uuid.UUID) (*Payment, error) {
 	row := s.pool.QueryRow(ctx, `
 		UPDATE payments
-		SET status = 'pending', last_error = NULL, locked_until = NULL, updated_at = now()
+		SET status = 'pending', last_error = NULL, locked_until = NULL, published_at = NULL, updated_at = now()
 		WHERE id = $1 AND status = 'failed_final'
 		RETURNING `+cols,
 		id,

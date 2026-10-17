@@ -53,6 +53,7 @@ func (s *Store) ReclaimExpiredLeases(ctx context.Context) ([]StalePending, error
 		SET status = 'pending',
 		    last_error = 'processing lease expired; re-queued',
 		    locked_until = NULL,
+		    published_at = NULL,
 		    updated_at = now()
 		WHERE status = 'processing'
 		  AND locked_until IS NOT NULL
