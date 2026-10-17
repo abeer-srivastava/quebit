@@ -11,13 +11,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abeer-srivastava/quebit/internal/httpapi"
 	"github.com/abeer-srivastava/quebit/internal/payment"
 	"github.com/abeer-srivastava/quebit/internal/provider"
-	"github.com/abeer-srivastava/quebit/internal/queue"
 	"github.com/abeer-srivastava/quebit/internal/service"
 )
 
@@ -40,19 +38,9 @@ func setupHandler(t *testing.T) (*httpapi.Handler, *payment.Store) {
 	pool := testPool(t)
 	store := payment.NewStore(pool)
 
-	// These will fail to connect to Redis, but the handler tests
-	// that don't touch queue operations will still pass.
-	redisOpt := asynq.RedisClientOpt{Addr: "localhost:6379"}
-	queueCli := queue.NewClient(redisOpt)
-	inspector := queue.NewInspector(redisOpt)
-	t.Cleanup(func() {
-		queueCli.Close()
-		inspector.Close()
-	})
-
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	providerCli := provider.NewClient("http://localhost:9090")
-	svc := service.New(store, queueCli, inspector, providerCli, log)
+	svc := service.New(store, providerCli, log)
 	h := httpapi.NewHandler(svc, log)
 	return h, store
 }

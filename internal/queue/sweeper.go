@@ -8,20 +8,22 @@ import (
 	"github.com/abeer-srivastava/quebit/internal/payment"
 )
 
-// Sweeper periodically re-enqueues payments stuck in "pending" state.
-// This handles the gap where a DB insert succeeded but the Redis enqueue failed.
+// Sweeper periodically re-queues payments that have been stuck in "pending".
+//
+// It is the safety net for a task that was published and then lost — most
+// likely because Redis was flushed or failed over. It clears the outbox marker
+// on stale payments in a single statement and lets the relay republish them,
+// so recovery throughput is bounded by the relay rather than by this tick.
 type Sweeper struct {
-	store    payment.StaleFinder
-	client   Enqueuer
+	store    payment.OutboxResetter
 	interval time.Duration
 	staleAge int // seconds a payment must be pending before it's considered stale
 	log      *slog.Logger
 }
 
-func NewSweeper(store payment.StaleFinder, client Enqueuer, log *slog.Logger) *Sweeper {
+func NewSweeper(store payment.OutboxResetter, log *slog.Logger) *Sweeper {
 	return &Sweeper{
 		store:    store,
-		client:   client,
 		interval: 30 * time.Second,
 		staleAge: 60,
 		log:      log,
@@ -47,23 +49,12 @@ func (s *Sweeper) Run(ctx context.Context) error {
 }
 
 func (s *Sweeper) sweep(ctx context.Context) {
-	stale, err := s.store.FindStalePending(ctx, s.staleAge)
+	requeued, err := s.store.ResetStalePending(ctx, s.staleAge)
 	if err != nil {
-		s.log.Error("sweeper: failed to find stale payments", "err", err)
+		s.log.Error("sweeper: failed to re-queue stale payments", "err", err)
 		return
 	}
-
-	if len(stale) == 0 {
-		return
-	}
-
-	s.log.Info("sweeper: found stale pending payments", "count", len(stale))
-
-	for _, sp := range stale {
-		if err := s.client.EnqueueProcess(ctx, sp.ID, sp.Amount); err != nil {
-			s.log.Error("sweeper: failed to enqueue", "id", sp.ID, "err", err)
-			continue
-		}
-		s.log.Info("sweeper: re-enqueued stale payment", "id", sp.ID)
+	if requeued > 0 {
+		s.log.Warn("sweeper: re-queued stale pending payments", "count", requeued)
 	}
 }

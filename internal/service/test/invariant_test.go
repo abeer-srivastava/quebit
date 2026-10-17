@@ -44,14 +44,6 @@ func (c *countingProvider) Charge(ctx context.Context, req provider.ChargeReques
 	return &provider.ChargeResult{ProviderRef: "prov_" + req.PaymentID}, nil
 }
 
-type noopEnqueuer struct{}
-
-func (noopEnqueuer) EnqueueProcess(context.Context, uuid.UUID, int64) error { return nil }
-
-type noopReplayer struct{}
-
-func (noopReplayer) ReplayArchivedTask(string) error { return nil }
-
 // TestConcurrentProcessingChargesExactlyOnce is the core correctness invariant:
 // however many workers receive the same payment task at the same time, the
 // provider is charged exactly once and the payment ends up succeeded.
@@ -60,7 +52,7 @@ func TestConcurrentProcessingChargesExactlyOnce(t *testing.T) {
 	store := payment.NewStore(pool)
 	prov := &countingProvider{}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(store, noopEnqueuer{}, noopReplayer{}, prov, log)
+	svc := service.New(store, prov, log)
 
 	ctx := context.Background()
 	id := uuid.New()

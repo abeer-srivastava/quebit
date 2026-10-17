@@ -25,8 +25,6 @@ type CreateResult struct {
 // and the queue handler delegate to Service rather than calling store/queue directly.
 type Service struct {
 	store    payment.Repository
-	queue    queue.Enqueuer
-	replayer queue.TaskReplayer
 	provider provider.Charger
 	log      *slog.Logger
 }
@@ -34,24 +32,24 @@ type Service struct {
 // New creates a Service with all dependencies injected via interfaces.
 func New(
 	store payment.Repository,
-	q queue.Enqueuer,
-	replayer queue.TaskReplayer,
 	prov provider.Charger,
 	log *slog.Logger,
 ) *Service {
 	return &Service{
 		store:    store,
-		queue:    q,
-		replayer: replayer,
 		provider: prov,
 		log:      log,
 	}
 }
 
-// CreatePayment validates, persists, and enqueues a new payment.
-// If the idempotency key already exists, it returns the existing payment
-// with Created=false. Enqueue failures are logged but not fatal — the
-// sweeper will pick up orphaned pending payments.
+// CreatePayment validates and persists a new payment.
+//
+// It does not touch Redis: the INSERT leaves the outbox marker unset, so the
+// relay is guaranteed to hand the payment to the queue. There is no window in
+// which the database records a payment that nothing will ever process.
+//
+// If the idempotency key already exists, it returns the existing payment with
+// Created=false.
 func (s *Service) CreatePayment(ctx context.Context, key string, amount int64, currency string) (*CreateResult, error) {
 	p := &payment.Payment{
 		ID:             uuid.New(),
@@ -67,22 +65,12 @@ func (s *Service) CreatePayment(ctx context.Context, key string, amount int64, c
 		return nil, fmt.Errorf("create payment: %w", err)
 	}
 
-	result := &CreateResult{
-		Payment:  created,
-		Created:  isNew,
-		Enqueued: false,
-	}
-
-	if isNew {
-		if err := s.queue.EnqueueProcess(ctx, created.ID, created.Amount); err != nil {
-			s.log.Error("failed to enqueue payment", "id", created.ID, "err", err)
-			// Payment exists in DB as pending — sweeper can pick it up
-		} else {
-			result.Enqueued = true
-		}
-	}
-
-	return result, nil
+	return &CreateResult{
+		Payment: created,
+		Created: isNew,
+		// A new row is always queued for delivery; the relay owns the enqueue.
+		Enqueued: isNew,
+	}, nil
 }
 
 // GetPayment retrieves a payment by ID.
@@ -90,25 +78,15 @@ func (s *Service) GetPayment(ctx context.Context, id uuid.UUID) (*payment.Paymen
 	return s.store.Get(ctx, id)
 }
 
-// RetryPayment replays a failed_final payment. The transition back to pending
-// is atomic, so concurrent retries cannot both succeed. It then prefers
-// replaying the archived Asynq task and falls back to a fresh enqueue.
+// RetryPayment returns a failed_final payment to the queue. The transition back
+// to pending is atomic, so concurrent retries cannot both succeed; the same
+// statement clears the outbox marker, so the relay re-publishes the payment.
 func (s *Service) RetryPayment(ctx context.Context, id uuid.UUID) error {
 	// Atomically claim the retry: only one concurrent caller can move
 	// failed_final → pending.
-	p, err := s.store.ResetForRetry(ctx, id)
-	if err != nil {
+	if _, err := s.store.ResetForRetry(ctx, id); err != nil {
 		return err // ErrNotFound | ErrNotRetryable | DB error
 	}
-
-	// Try to replay the archived task via the Asynq Inspector.
-	if err := s.replayer.ReplayArchivedTask(id.String()); err != nil {
-		s.log.Warn("inspector replay failed, re-enqueuing fresh task", "id", id, "err", err)
-		if err := s.queue.EnqueueProcess(ctx, id, p.Amount); err != nil {
-			return fmt.Errorf("re-enqueue: %w", err)
-		}
-	}
-
 	return nil
 }
 

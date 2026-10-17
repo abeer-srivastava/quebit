@@ -42,9 +42,9 @@ func (s *Store) PublishPending(ctx context.Context, limit int, publish func(id u
 		return 0, err
 	}
 
-	items := make([]StalePending, 0, limit)
+	items := make([]PendingPayment, 0, limit)
 	for rows.Next() {
-		var it StalePending
+		var it PendingPayment
 		if err := rows.Scan(&it.ID, &it.Amount); err != nil {
 			rows.Close()
 			return 0, err

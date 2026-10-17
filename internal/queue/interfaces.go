@@ -12,12 +12,6 @@ type Enqueuer interface {
 	EnqueueProcess(ctx context.Context, id uuid.UUID, amount int64) error
 }
 
-// TaskReplayer replays archived (failed) tasks.
-// Implementations: *Inspector (asynq). Test doubles can mock this.
-type TaskReplayer interface {
-	ReplayArchivedTask(taskID string) error
-}
-
 // Processor processes a single payment by ID.
 // This interface breaks the import cycle: queue/handler depends on this
 // interface instead of importing the service package directly.

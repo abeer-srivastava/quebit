@@ -20,14 +20,21 @@ type Repository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
-// StaleFinder finds payments stuck in pending state. Separated from Repository
-// because only the sweeper needs this — keeps the core interface focused.
-type StaleFinder interface {
-	FindStalePending(ctx context.Context, olderThanSeconds int) ([]StalePending, error)
+// OutboxRelay drains the transactional outbox: it hands payments that have been
+// persisted but not yet queued to a publish callback. Separated from Repository
+// because only the relay needs it.
+type OutboxRelay interface {
+	PublishPending(ctx context.Context, limit int, publish func(id uuid.UUID, amount int64) error) (int, error)
+}
+
+// OutboxResetter requests a re-publish of payments whose queued task may have
+// been lost. Separated from Repository because only the sweeper needs it.
+type OutboxResetter interface {
+	ResetStalePending(ctx context.Context, olderThanSeconds int) (int64, error)
 }
 
 // LeaseReclaimer returns payments whose processing lease has expired to the
 // pending state. Separated from Repository because only the reaper needs it.
 type LeaseReclaimer interface {
-	ReclaimExpiredLeases(ctx context.Context) ([]StalePending, error)
+	ReclaimExpiredLeases(ctx context.Context) ([]PendingPayment, error)
 }

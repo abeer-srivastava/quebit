@@ -63,15 +63,17 @@ func main() {
 
 	// Dependencies
 	store := payment.NewStore(pool)
+
 	providerCli := provider.NewClient(cfg.ProviderURL)
 	providerCli.APIKey = cfg.ProviderAPIKey
+
+	// The queue client is only used by the outbox relay; the HTTP path never
+	// enqueues directly.
 	queueCli := queue.NewClient(redisOpt)
 	defer queueCli.Close()
-	inspector := queue.NewInspector(redisOpt)
-	defer inspector.Close()
 
 	// Service layer — single point of business logic
-	svc := service.New(store, queueCli, inspector, providerCli, log)
+	svc := service.New(store, providerCli, log)
 
 	// Asynq worker
 	asynqServer := queue.NewServer(redisOpt, cfg.WorkerConcurrency)
@@ -79,11 +81,14 @@ func main() {
 	queueHandler := queue.NewHandler(svc, log)
 	queueHandler.Register(mux)
 
-	// Stale pending sweeper
-	sweeper := queue.NewSweeper(store, queueCli, log)
+	// Outbox relay — publishes persisted payments to the queue
+	relay := queue.NewRelay(store, queueCli, log)
+
+	// Stale pending sweeper — re-queues payments whose task was lost
+	sweeper := queue.NewSweeper(store, log)
 
 	// Expired processing-lease reaper
-	reaper := queue.NewReaper(store, queueCli, log)
+	reaper := queue.NewReaper(store, log)
 
 	// HTTP server
 	httpMux := http.NewServeMux()
@@ -134,6 +139,10 @@ func main() {
 			return fmt.Errorf("http server: %w", err)
 		}
 		return nil
+	})
+
+	g.Go(func() error {
+		return relay.Run(gctx)
 	})
 
 	g.Go(func() error {
