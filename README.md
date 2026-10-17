@@ -1,49 +1,61 @@
 # Quebit
 
-An asynchronous, queue-based payment processing pipeline written in Go, backed by **PostgreSQL** (durable state) and **Redis/Asynq** (work distribution).
+[![CI](https://github.com/abeer-srivastava/quebit/actions/workflows/ci.yml/badge.svg)](https://github.com/abeer-srivastava/quebit/actions/workflows/ci.yml)
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
+![Postgres](https://img.shields.io/badge/Postgres-source%20of%20truth-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis%20%C2%B7%20Asynq-disposable%20queue-DC382D?logo=redis&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-Quebit decouples *accepting* a payment from *processing* it. The HTTP layer validates and persists a payment, then hands it to a Redis-backed task queue. A pool of workers pulls tasks, charges an external provider, and writes the outcome back to Postgres — all while remaining safe against duplicates, transient failures, and restarts.
+**An asynchronous payment pipeline in Go: idempotent, retry-safe, and priority-routed.**
 
----
+Charging a card is slow, flaky, and must never happen twice. Quebit separates *accepting* a payment from *processing* it. PostgreSQL holds the durable state; Redis/Asynq distributes the work. The HTTP layer validates and persists the payment, then hands a task to the queue; a pool of workers charges an external provider and records the outcome — staying correct across duplicate requests, duplicate deliveries, transient provider failures, and worker crashes.
 
-## Table of Contents
+> **Status:** portfolio project. The core pipeline is complete and tested; the hardening work that closes the remaining design gaps is tracked in the [roadmap](#roadmap).
+
+<details>
+<summary><b>Table of contents</b></summary>
 
 - [Architecture](#architecture)
+- [Design decisions](#design-decisions)
+- [Guarantees and non-guarantees](#guarantees-and-non-guarantees)
 - [Features](#features)
-- [Payment Lifecycle](#payment-lifecycle)
-- [Quick Start](#quick-start)
+- [Payment lifecycle](#payment-lifecycle)
+- [Quick start](#quick-start)
 - [Configuration](#configuration)
-- [API Reference](#api-reference)
-- [Reliability & Failure Handling](#reliability--failure-handling)
+- [API reference](#api-reference)
+- [Reliability and failure handling](#reliability-and-failure-handling)
 - [Observability](#observability)
 - [Testing](#testing)
-- [Project Layout](#project-layout)
-- [Roadmap / Suggested Improvements](#roadmap--suggested-improvements)
+- [Project layout](#project-layout)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+</details>
 
 ---
 
 ## Architecture
 
-```
-HTTP Request
-   │
-   ▼
-[ Logger middleware ] → [ Panic recovery ] → [ Rate limiter ]
-   │
-   ▼
-HTTP Handler ──► validate ──► Postgres (INSERT … ON CONFLICT) ──► Redis/Asynq (enqueue)
-                                 │                                    │
-                            202 Accepted                              ▼
-                                                          Asynq Worker (dequeue)
-                                                                 │
-                                                                 ▼
-                                                     Provider HTTP call (/charge)
-                                                                 │
-                                                                 ▼
-                                                     Postgres (update status)
+```mermaid
+flowchart TD
+    C[Client] --> MW["Middleware<br/>logger → panic recovery → rate limiter"]
+    MW --> H[HTTP handler]
+    H -->|"validate · INSERT … ON CONFLICT"| PG[(PostgreSQL)]
+    H -->|enqueue| Q[(Redis / Asynq)]
+    H -.->|202 Accepted| C
+    Q --> W[Asynq worker pool]
+    W -->|"Claim + lease"| PG
+    W -->|"POST /charge<br/>Idempotency-Key"| P[Payment provider]
+    W -->|update status| PG
+    R[Processing-timeout reaper] -->|"expired lease → pending"| PG
+    R -->|re-enqueue| Q
+    S[Stale-pending sweeper] -->|re-enqueue stuck pending| Q
+    S --> PG
 ```
 
-**Queue routing by amount** — higher-value payments get proportionally more worker attention:
+PostgreSQL is the source of truth; Redis only ever holds *work in flight*. Both background loops are recovery paths, not primary flow: the **sweeper** re-enqueues payments left in `pending` when the enqueue failed, and the **reaper** returns payments whose processing **lease** expired (the worker died mid-charge) to `pending`.
+
+**Queue routing by amount.** Higher-value payments get more worker attention without starving the rest.
 
 | Amount | Queue | Weight |
 |---|---|---|
@@ -51,92 +63,178 @@ HTTP Handler ──► validate ──► Postgres (INSERT … ON CONFLICT) ─�
 | `1,000 – 9,999` | `default` | 3 |
 | `< 1,000` | `low` | 1 |
 
-The weight controls how often the worker polls each queue, so critical work is drained first without starving the others.
+The weight controls how often the worker polls each queue, so critical work drains first while `default` and `low` still make progress.
+
+---
+
+## Design decisions
+
+**Why a queue instead of charging inline?**
+Provider calls are slow and fail transiently. Doing them inside the request would tie API latency and availability to the provider's. With a queue the API returns `202` quickly and retries happen out of band.
+
+**Why Asynq rather than Kafka or RabbitMQ?**
+The workload is a *task queue* — retries, backoff, priorities, delayed retries, and an inspector for replay — not an event log. Asynq provides all of that on Redis, keeping the operational footprint to two dependencies.
+
+**Why is Postgres the source of truth and Redis disposable?**
+Payment state must survive anything. If Redis is flushed, no payment is lost: the rows are still in Postgres and the sweeper re-enqueues anything stuck in `pending`. Losing Redis costs throughput, not money.
+
+**Why three layers of idempotency?**
+Each layer covers a different failure:
+1. A `UNIQUE` constraint on `idempotency_key` stops duplicate *requests* from creating duplicate rows.
+2. Queue-level `TaskID` deduplication stops duplicate *enqueues*.
+3. An atomic `Claim` (`UPDATE … WHERE status IN ('pending','retrying') RETURNING`) stops duplicate *deliveries* from charging twice — only one worker can move a payment into `processing`.
+
+The provider also receives `Idempotency-Key: <payment_id>`, so a retry after an ambiguous failure cannot double-charge on the provider side.
+
+**Why a request hash on the idempotency key?**
+A key that comes back with a different amount or currency is a client bug. Returning the original row would silently mis-charge. The stored request hash is compared on replay and a mismatch is rejected with `409`.
+
+**Why exponential backoff with jitter?**
+Plain backoff makes every failed task retry at the same instant, producing synchronized load spikes against a provider that is already struggling. Up to 20% jitter spreads them out, and the 10-minute cap bounds how long a payment can wait.
+
+**Why a processing lease plus a reaper?**
+`Claim` moves a payment to `processing` and takes a 90-second lease (`locked_until`). If the worker dies between the provider call and the DB write, the lease expires and the reaper returns the payment to `pending`. Re-charging is safe because the provider call is idempotent per payment ID.
+
+**Why restrict `Claim` to `pending`/`retrying`?**
+So a payment can have exactly one owner at a time. If a duplicate task arrives while the payment is already `processing`, the second worker's `UPDATE … WHERE status IN (…)` matches nothing and it exits — no second charge. Recovery of genuinely stuck payments is the reaper's job, not a concurrent claim's.
+
+**Why does the rate limiter fail open?**
+If Redis is down, rejecting all traffic would turn a limiter outage into a full API outage. Failing open trades temporary loss of protection for availability. For a payments API you may prefer the opposite; that is a deliberate, documented tradeoff.
+
+**Why classify provider errors?**
+Retrying a `422` can never succeed and wastes the retry budget, while giving up on a `503` loses a payment that would have worked. Network errors, `429`, and `5xx` are retryable; other `4xx` are terminal.
+
+---
+
+## Guarantees and non-guarantees
+
+| | |
+|---|---|
+| ✅ **At-least-once processing** | A task is redelivered until acknowledged, so a crash does not lose work. |
+| ✅ **Effectively-once charging** | The `Claim` guard plus `Idempotency-Key: <payment_id>` stop a redelivered task from charging twice. |
+| ✅ **Terminal states are final** | A payment reaches `succeeded` or `failed_final` once; only the explicit retry endpoint can reopen a `failed_final` payment. |
+| ✅ **No silent loss on enqueue failure** | If the DB insert succeeds but the enqueue fails, the sweeper re-enqueues the payment. |
+| ✅ **Stuck `processing` is recovered** | A crashed worker's payment is returned to `pending` once its 90 s lease expires. |
+| ⚠️ **Eventual, not immediate, enqueue** | There is a bounded window (up to the sweeper interval) between insert and enqueue when the enqueue fails. See *transactional outbox* in the [Roadmap](#roadmap). |
+| ⚠️ **Recovery is bounded, not instant** | A stuck payment is retried after its lease expires and the reaper runs, so recovery latency is measured in tens of seconds. |
+| ❌ **No ordering guarantee** | Payments are processed concurrently across queues; there is no FIFO guarantee between them. |
+| ❌ **Not exactly-once at the provider** | Correctness relies on the provider honoring `Idempotency-Key`. |
 
 ---
 
 ## Features
 
-- **Asynchronous queueing** — Submission is decoupled from processing via Asynq (Redis-backed), so the API stays fast and the pipeline survives restarts.
-- **Dynamic priority routing** — Payments are routed to `critical` / `default` / `low` queues by amount (see table above).
-- **Idempotency guard** — Three layers of protection:
-  1. A Postgres `UNIQUE` constraint on `idempotency_key` (duplicate creates return the original row).
-  2. Queue-level `TaskID` deduplication.
-  3. An atomic `Claim` update that refuses to re-process terminal payments.
-- **Automatic retries with exponential backoff + jitter** — Transient provider failures (network errors, `429`, `5xx`) are retried up to **8 times** with backoff capped at 10 minutes plus up to 20% jitter.
-- **Retry-exhaustion safety net** — When the retry budget is used up, the payment is moved to `failed_final` instead of being left stuck in `retrying`.
-- **Terminal error handling** — Unrecoverable provider errors (e.g. `422`) immediately mark the payment `failed_final` and tell Asynq to skip further retries.
-- **Manual replay** — `POST /v1/payments/{id}/retry` replays an archived task via the Asynq Inspector, falling back to a fresh enqueue if the archived task is gone.
-- **Stale pending sweeper** — A background loop re-enqueues payments stuck in `pending`, covering the gap where the DB insert succeeds but the Redis enqueue fails.
-- **Sliding-window rate limiting** — An atomic Redis Lua script enforces a per-IP request budget, honoring `X-Forwarded-For` / `X-Real-IP`, and fails open if Redis is unavailable.
-- **Panic recovery** — A middleware converts handler panics into `500` responses (logged with a stack trace) instead of crashing the process.
-- **Request tracing** — Every response carries an `X-Request-ID` (echoed if supplied), included in request logs.
-- **Structured, configurable logging** — JSON logs via `slog`, level controlled by `LOG_LEVEL`.
-- **Graceful shutdown** — `errgroup` + `signal.NotifyContext` drain the HTTP server before stopping the Asynq worker on `SIGINT`/`SIGTERM`.
-- **Health check** — `GET /healthz` pings both Postgres and Redis.
-- **Tunable I/O** — HTTP body capped at 1 MiB, provider responses capped at 1 KiB, provider HTTP timeout of 10s.
-- **CI** — GitHub Actions builds, vets, applies migrations, and runs the race-enabled test suite against a live Postgres.
+- **Asynchronous queueing** — submission is decoupled from processing via Asynq, so the API stays fast and the pipeline survives restarts.
+- **Dynamic priority routing** — `critical` / `default` / `low` queues chosen by amount.
+- **Three-layer idempotency** — a unique key constraint, queue `TaskID` dedup, and an atomic `Claim`.
+- **Idempotency-key fingerprint** — a reused key with a different amount/currency is rejected (`409`) instead of silently returning the original payment.
+- **Processing lease + reaper** — a crashed worker cannot strand a payment in `processing`; the lease expires and the payment is re-queued.
+- **Retries with exponential backoff and jitter** — transient failures retry up to 8 times, capped at 10 minutes plus up to 20% jitter.
+- **Retry-exhaustion safety net** — when the budget is spent the payment moves to `failed_final` instead of sticking in `retrying`.
+- **Terminal error handling** — unrecoverable errors (e.g. `422`) mark the payment `failed_final` immediately and tell Asynq to skip retries.
+- **Manual replay** — `POST /v1/payments/{id}/retry` atomically moves a `failed_final` payment back to `pending`, replays the archived task, and falls back to a fresh enqueue; concurrent retries cannot both win.
+- **Stale pending sweeper** — re-enqueues payments stuck in `pending` (DB insert succeeded, enqueue failed).
+- **Sliding-window rate limiting** — an atomic Redis Lua script enforces a per-IP budget and fails open. `X-Forwarded-For` / `X-Real-IP` are honored **only** from configured trusted proxy networks, so the limit cannot be spoofed.
+- **Money is explicit** — `amount` is always in the currency's **minor unit** (cents), and `currency` is validated against an ISO 4217 allowlist and normalized.
+- **Panic recovery** — handler panics become `500` responses with a logged stack trace instead of crashing the process.
+- **Request tracing** — every response carries an `X-Request-ID` (echoed if supplied) that appears in the logs.
+- **Structured logging** — JSON via `slog`, level set by `LOG_LEVEL`.
+- **Graceful shutdown** — `errgroup` + `signal.NotifyContext` drain the HTTP server, then the worker, on `SIGINT`/`SIGTERM`.
+- **Health check** — `GET /healthz` pings Postgres and Redis.
+- **Bounded I/O** — request body capped at 1 MiB, provider response at 1 KiB, provider timeout 10 s.
+- **CI** — GitHub Actions builds, vets, applies migrations with `ON_ERROR_STOP=1`, asserts the schema, and runs the race-enabled suite against a live Postgres.
 
 ---
 
-## Payment Lifecycle
+## Payment lifecycle
 
-```
-                    ┌──────────┐   Claim    ┌────────────┐  provider 2xx   ┌───────────┐
-  create  ───────►  │ pending  │ ─────────► │ processing │ ──────────────► │ succeeded │
-                    └──────────┘            └────────────┘                 └───────────┘
-                                                     │
-                                    transient error  │  terminal error (4xx, non-retryable)
-                                                     ▼                          │
-                                              ┌───────────┐                     ▼
-                                              │ retrying  │             ┌───────────────┐
-                                              └───────────┘             │  failed_final │
-                                                    │                   └───────────────┘
-                              retries exhausted     │                          ▲
-                                                    └──────────────────────────┘
-                                            (or manual POST …/retry resets to pending)
+```mermaid
+stateDiagram-v2
+    [*] --> pending: create
+    pending --> processing: Claim (lease)
+    processing --> succeeded: provider 2xx
+    processing --> retrying: transient error
+    retrying --> processing: retry (backoff + jitter)
+    processing --> pending: lease expired (reaper)
+    processing --> failed_final: terminal error (4xx)
+    retrying --> failed_final: retries exhausted
+    failed_final --> pending: manual POST /retry
+    succeeded --> [*]
 ```
 
-- **Statuses**: `pending`, `processing`, `retrying`, `succeeded`, `failed_final`.
-- A payment only becomes `succeeded` or `failed_final` once — the `Claim` guard prevents a redelivered task from charging twice.
+Statuses: `pending`, `processing`, `retrying`, `succeeded`, `failed_final`. The `Claim` guard, plus the provider idempotency key, ensure a redelivered task cannot charge twice.
 
 ---
 
-## Quick Start
+## Quick start
 
 **Prerequisites:** Go 1.26+, Docker & Docker Compose.
 
 ```bash
-# 1. Start Postgres + Redis (migrations auto-applied on first boot)
-docker compose up -d          # or: make up
+# 1. Start Postgres + Redis (migrations auto-apply on first boot)
+make up
 
 # 2. Start the mock payment provider (separate terminal)
 go run ./cmd/mockprovider
 
-# 3. Start the server: HTTP API + Asynq worker + sweeper
-LOG_LEVEL=DEBUG go run ./cmd/server       # or: make dev
+# 3. Start the server: HTTP API + Asynq worker + reaper + sweeper
+make dev
 ```
 
-Create a payment and watch it flow through the pipeline:
+Create a payment and watch it move through the pipeline:
 
 ```bash
-# Create (routes to `default`, amount 5,000)
-curl -i -X POST http://localhost:8080/v1/payments \
+# Create — routes to `default` (amount 5,000)
+curl -s -X POST localhost:8080/v1/payments \
   -H 'Content-Type: application/json' \
   -d '{"idempotency_key":"order-123","amount":5000,"currency":"USD"}'
-
-# Look it up
-curl http://localhost:8080/v1/payments/<id>
-
-# Health
-curl http://localhost:8080/healthz
 ```
 
-Other useful `make` targets:
+```json
+{
+  "payment": {
+    "id": "b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11",
+    "idempotency_key": "order-123",
+    "amount": 5000,
+    "currency": "USD",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-01-01T12:00:00Z",
+    "updated_at": "2026-01-01T12:00:00Z"
+  },
+  "created": true,
+  "enqueued": true
+}
+```
+
+```bash
+# Look it up a moment later — a worker has charged the provider
+curl -s localhost:8080/v1/payments/b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11
+```
+
+```json
+{
+  "payment": {
+    "id": "b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11",
+    "idempotency_key": "order-123",
+    "amount": 5000,
+    "currency": "USD",
+    "status": "succeeded",
+    "attempts": 1,
+    "provider_ref": "prov_b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11",
+    "created_at": "2026-01-01T12:00:00Z",
+    "updated_at": "2026-01-01T12:00:00Z"
+  }
+}
+```
+
+A ready-made request collection lives in [`api.http`](./api.http).
+
+### Make targets
 
 | Target | Description |
 |---|---|
-| `make up` / `make down` | Start / stop Postgres + Redis (down removes volumes) |
+| `make up` / `make down` | Start / stop Postgres + Redis (`down` removes volumes) |
 | `make dev` | Run the server locally |
 | `make test` | All tests with the race detector |
 | `make test-unit` | Tests that need no external services |
@@ -144,88 +242,103 @@ Other useful `make` targets:
 | `make build` | Build `bin/quebit` |
 | `make fmt` | `gofmt -s -w .` |
 
-A ready-made request collection lives in [`api.http`](./api.http).
-
 ### Driving failure paths locally
 
-The mock provider switches behavior based on the `currency` sentinel:
+The mock provider switches behavior on the **amount**:
 
-| Currency | Result |
+| Amount | Provider result |
 |---|---|
-| `FAIL_TERMINAL` | `422` → payment goes straight to `failed_final` |
-| `FAIL_RETRYABLE` | `503` → payment retries, then becomes `failed_final` when the budget is exhausted |
+| `999999` | `422` (terminal) → the payment goes straight to `failed_final` |
+| `888888` | `503` (retryable) → the payment retries, then becomes `failed_final` when the budget is exhausted |
 | anything else | `200` with a generated `provider_ref` |
+
+> Sentinels are amounts, not currencies, because the API validates `currency` against an ISO 4217 allowlist — a sentinel currency is rejected with `422` before a worker ever runs.
 
 ---
 
 ## Configuration
 
-All configuration is via environment variables (a `.env` file is loaded automatically if present — see [`.env.example`](./.env.example)).
+All configuration is via environment variables. A `.env` file is loaded automatically if present — see [`.env.example`](./.env.example).
 
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable` | Postgres connection string |
 | `REDIS_ADDR` | `localhost:6379` | Redis address |
 | `HTTP_ADDR` | `:8080` | HTTP listen address |
-| `PROVIDER_URL` | `http://localhost:9090` | External payment provider base URL |
+| `PROVIDER_URL` | `http://localhost:9090` | Payment provider base URL |
 | `PROVIDER_API_KEY` | *(empty)* | Optional bearer token sent to the provider |
-| `WORKER_CONCURRENCY` | `10` | Number of concurrent Asynq worker goroutines |
+| `WORKER_CONCURRENCY` | `10` | Concurrent Asynq worker goroutines |
 | `RATE_LIMIT_RPS` | `100` | Max requests per second per client IP |
-| `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `TRUSTED_PROXIES` | *(empty)* | Comma-separated CIDRs whose `X-Forwarded-For` / `X-Real-IP` headers are trusted for rate limiting. Empty means those headers are ignored. |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, or `ERROR` |
 
-> `WORKER_CONCURRENCY` and `RATE_LIMIT_RPS` must be positive integers; invalid or missing values fall back to the defaults.
+`WORKER_CONCURRENCY` and `RATE_LIMIT_RPS` must be positive integers; invalid or missing values fall back to the defaults. A malformed `TRUSTED_PROXIES` value fails startup.
+
+> **Deploying behind a load balancer?** Set `TRUSTED_PROXIES` to the proxy's CIDR. Otherwise the rate limiter keys on the proxy's IP and all clients share one budget.
 
 ### Provider contract
 
-Quebit calls `POST {PROVIDER_URL}/charge` with:
+Quebit calls `POST {PROVIDER_URL}/charge`:
 
 ```json
 { "payment_id": "…", "amount": 5000, "currency": "USD" }
 ```
 
-Headers: `Content-Type: application/json`, `Idempotency-Key: <payment_id>`, and `Authorization: Bearer <PROVIDER_API_KEY>` when configured. A `2xx` response may include `{"provider_ref": "…"}`; any non-`2xx` is treated as an error (`429`/`5xx` retryable, other `4xx` terminal).
+Headers: `Content-Type: application/json`, `Idempotency-Key: <payment_id>`, and `Authorization: Bearer <PROVIDER_API_KEY>` when configured.
+
+A `2xx` response may include `{"provider_ref": "…"}`. Any non-`2xx` is an error: `429` and `5xx` are retryable, other `4xx` are terminal.
 
 ---
 
-## API Reference
+## API reference
 
 ### `POST /v1/payments`
 
 Create and enqueue a payment.
 
-**Request**
 ```json
 { "idempotency_key": "order-123", "amount": 5000, "currency": "USD" }
 ```
 
-**Validation:** `amount > 0`, non-empty `idempotency_key` (≤ 255 chars), non-empty `currency`. Malformed JSON → `400`; validation failure → `422`.
+`amount` is in the currency's **minor unit**: `5000` = `50.00 USD`.
 
-**Responses**
-- `202 Accepted` — new payment accepted for processing:
-  ```json
-  {
-    "payment": { "id": "…", "status": "pending", "amount": 5000, "idempotency_key": "order-123", "attempts": 0, "created_at": "…", "updated_at": "…" },
-    "created": true,
-    "enqueued": true
-  }
-  ```
-- `200 OK` — idempotent replay; returns the existing payment with `"created": false`.
+**Validation:** `amount > 0`; non-empty `idempotency_key` (≤ 255 chars); `currency` present and in the ISO 4217 allowlist (case-insensitive, normalized to upper case). Malformed JSON → `400`; validation failure → `422`.
+
+| Status | Meaning |
+|---|---|
+| `202 Accepted` | New payment accepted for processing |
+| `200 OK` | Idempotent replay — returns the existing payment with `"created": false` |
+| `409 Conflict` | The idempotency key was reused with different parameters |
+
+```json
+{
+  "payment": {
+    "id": "…", "status": "pending", "amount": 5000,
+    "currency": "USD", "idempotency_key": "order-123", "attempts": 0,
+    "created_at": "…", "updated_at": "…"
+  },
+  "created": true,
+  "enqueued": true
+}
+```
 
 ### `GET /v1/payments/{id}`
 
 ```json
-{ "payment": { "id": "…", "status": "succeeded", "provider_ref": "prov_…", "attempts": 1, "…": "…" } }
+{ "payment": { "id": "…", "status": "succeeded", "provider_ref": "prov_…", "attempts": 1 } }
 ```
 
-Returns `404` if not found, `400` if the `id` is not a UUID.
+`404` if not found, `400` if the id is not a UUID.
 
 ### `POST /v1/payments/{id}/retry`
 
-Replay a `failed_final` payment.
+Reopen a `failed_final` payment.
 
-- `202 Accepted` → `{ "status": "retrying" }`
-- `404 Not Found` — no such payment
-- `409 Conflict` — payment is not in `failed_final`
+| Status | Meaning |
+|---|---|
+| `202 Accepted` | `{ "status": "retrying" }` |
+| `404 Not Found` | No such payment |
+| `409 Conflict` | Payment is not in `failed_final` |
 
 ### `GET /healthz`
 
@@ -233,42 +346,53 @@ Replay a `failed_final` payment.
 { "postgres": true, "redis": true }
 ```
 
-`200` when both dependencies respond within 3s, `503` otherwise.
+`200` when both dependencies respond within 3 s, `503` otherwise.
 
 ### Rate limiting
 
-Every request is counted against a per-IP sliding window (`RATE_LIMIT_RPS` per second). Over-budget requests receive `429` with a `Retry-After` header. If Redis is unreachable, requests are allowed through (fail-open).
+Every request counts against a per-IP sliding window (`RATE_LIMIT_RPS` per second). Over-budget requests get `429` with a `Retry-After` header. The client IP is `RemoteAddr` unless it falls inside `TRUSTED_PROXIES`, in which case `X-Forwarded-For` / `X-Real-IP` is honored. If Redis is unreachable, requests are allowed through (fail-open).
 
 ---
 
-## Reliability & Failure Handling
+## Reliability and failure handling
 
 | Failure | Behavior |
 |---|---|
 | Duplicate `POST` (same idempotency key) | Returns the original payment, `created=false`, no re-enqueue |
+| Same key, different amount/currency | `409 Conflict`; the original payment is untouched |
 | DB insert succeeds, enqueue fails | Payment stays `pending`; the **sweeper** re-enqueues it |
-| Duplicate task delivery | `Claim` returns `ErrAlreadyDone`; the payment is skipped |
-| Provider network error / `429` / `5xx` | Marked `retrying`, retried with exponential backoff + jitter (max 8) |
-| Retry budget exhausted | Marked `failed_final`; task is archived (`SkipRetry`) |
+| Duplicate task delivery | `Claim` finds no claimable row, returns `ErrAlreadyDone`; the payment is skipped |
+| Worker dies mid-charge | Its lease expires; the **reaper** returns the payment to `pending` and re-enqueues it (safe — the provider call is idempotent) |
+| Provider network error / `429` / `5xx` | Marked `retrying`; retried with exponential backoff + jitter (max 8) |
+| Retry budget exhausted | Marked `failed_final`; the task is archived (`SkipRetry`) |
 | Provider `4xx` (non-retryable, e.g. `422`) | Marked `failed_final` immediately; no retries |
+| Two concurrent manual retries | Only one wins the atomic `failed_final → pending` transition |
+| Spoofed `X-Forwarded-For` | Ignored unless the peer is in `TRUSTED_PROXIES` |
 | Handler panic | Recovered by middleware → `500`, stack logged, process survives |
 | Redis down (rate limiter) | Fails open — requests proceed |
-| `SIGINT` / `SIGTERM` | HTTP server drained, then Asynq worker drained, within a 30s window |
+| `SIGINT` / `SIGTERM` | HTTP server drained, then the Asynq worker drained, within a 30 s window |
+
+<!-- TODO (after load/chaos testing): add a "Verified under failure" subsection with results, e.g.
+     "Killed Redis and Postgres mid-run at N req/s: 0 double charges, 0 payments stuck." -->
 
 ---
 
 ## Observability
 
-- **Structured JSON logs** via `log/slog`; set `LOG_LEVEL=DEBUG` to trace request entry/exit, enqueue/reschedule, provider calls, and status transitions.
+- **Structured JSON logs** via `log/slog`. Set `LOG_LEVEL=DEBUG` to trace request entry/exit, enqueue/reschedule, provider calls, and status transitions.
 - **Request logs** include `request_id`, method, path, status, duration, and bytes written.
 - **Request correlation** via the `X-Request-ID` header (generated if absent).
+
+Prometheus metrics and OpenTelemetry tracing are tracked in the [Roadmap](#roadmap).
 
 ---
 
 ## Testing
 
+Tests live in a `test/` subdirectory of each module and exercise packages through their public API.
+
 ```bash
-# Unit tests — no external dependencies (rate-limit tests use miniredis)
+# Unit tests: no external dependencies (rate-limit tests use miniredis)
 go test ./internal/provider/test/ ./internal/queue/test/ ./internal/httpapi/test/
 
 # Full suite (integration tests skip themselves unless DATABASE_URL is set)
@@ -276,37 +400,59 @@ DATABASE_URL=postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable \
   go test -v -race ./...
 ```
 
-Tests live in a `test/` subdirectory of each module and exercise packages through their public API.
+The suite includes a **concurrency invariant test**: ten goroutines process the same payment at once and the provider is charged exactly once (`internal/service/test`), plus store-level tests for the lease/reaper, the idempotency fingerprint, and the atomic retry transition.
+
+<!-- TODO: add a Benchmarks / Results section once load-test numbers exist (tool, req/s, p95 latency,
+     time to drain the queue, hardware). -->
 
 ---
 
-## Project Layout
+## Project layout
 
 ```
-cmd/server/main.go             — entry point: config, wiring, graceful shutdown
-cmd/mockprovider/main.go       — runnable fake provider for local development
-internal/payment/              — Payment model, repository interfaces, Postgres store, stale sweeper
-internal/provider/             — Charger interface, HTTP client, provider error classification
-internal/queue/                — Asynq client/server, task types & routing, handler, inspector, sweeper
-internal/httpapi/              — HTTP handlers, error types, request logger, rate limiter, recovery, health
-internal/service/              — Business logic coordinating store, queue, and provider
-migrations/                    — SQL schema migrations (applied in order)
-*/*/test/                      — black-box tests (package test)
+cmd/server/main.go        entry point: config, wiring, graceful shutdown
+cmd/mockprovider/main.go  runnable fake provider for local development
+internal/payment/         Payment model, repository interfaces, Postgres store, lease reaper, stale sweeper
+internal/provider/        Charger interface, HTTP client, provider error classification
+internal/queue/           Asynq client/server, task types & routing, handler, inspector, sweeper, reaper
+internal/httpapi/         HTTP handlers, error types, request logger, rate limiter, recovery, health
+internal/service/         business logic coordinating store, queue, and provider
+migrations/               ordered SQL migrations (applied in order)
+*/*/test/                 black-box tests (package test)
 ```
 
 ---
 
-## Roadmap / Suggested Improvements
+## Roadmap
 
-These are intentionally *not* implemented yet — they're the next steps toward a production-grade system:
+### Done
 
-- **Circuit breaker for the provider** — stop hammering a failing provider; fail fast and let the sweeper/retry path recover.
-- **Transactional outbox** — persist the intent to enqueue in the same transaction as the payment insert, then relay to Redis, eliminating the sweeper's eventual-consistency window.
-- **Dead-letter queue + alerting** — route exhausted tasks to a DLQ with an operator view rather than only archiving them.
-- **Metrics (Prometheus)** — queue depth, processing latency, retry counts, error rates, and sweeper throughput.
-- **Distributed tracing (OpenTelemetry)** — propagate trace context across HTTP, Asynq tasks, and provider calls.
-- **Readiness vs. liveness** — split `/healthz` into `/livez` (process) and `/readyz` (DB + Redis).
-- **Per-route rate limits & auth** — API keys/JWT, scoped limits, and CORS/security headers.
-- **Migration tooling** — move to a versioned migration tool (e.g. `golang-migrate`) with up/down and checksums in CI.
-- **Secrets management** — load credentials from a secret store instead of plain env vars.
-- **Broader test coverage** — table-driven handler tests, property-based tests for routing/backoff, and chaos tests for Redis/DB blips.
+- [x] **Processing-timeout reaper** — a processing lease (`locked_until`) with a background reaper that returns payments whose worker died mid-charge to `pending`.
+- [x] **Idempotency payload check** — a stored request hash and a `409` when a key is reused with a different amount/currency.
+- [x] **Atomic manual retry** — the `failed_final → pending` transition is a single `UPDATE … WHERE … RETURNING`, so concurrent retries cannot both succeed.
+- [x] **Trusted-proxy handling** — `X-Forwarded-For` / `X-Real-IP` are honored only from configured proxy CIDRs.
+- [x] **ISO 4217 currency validation** and `amount` documented as minor units.
+
+### Next
+
+- [ ] **Transactional outbox** — write the enqueue intent in the same transaction as the payment insert and relay it to Redis (`FOR UPDATE SKIP LOCKED`), closing the sweeper's eventual-consistency window. The sweeper then becomes a pure safety net.
+- [ ] **Circuit breaker** around the provider — fail fast during outages; with 8 retries and 10 workers, a provider outage otherwise hammers it.
+- [ ] **Load and chaos tests** — verify the "no double charge, nothing stuck" invariant while Redis/Postgres are killed mid-run, and publish the numbers here.
+
+### Ideas
+
+- [ ] Prometheus metrics — queue depth (via the Asynq Inspector), payments by terminal status, provider latency histogram.
+- [ ] `/livez` (process) vs `/readyz` (DB + Redis) split.
+- [ ] OpenTelemetry tracing across HTTP, Asynq tasks, and provider calls.
+- [ ] Per-merchant API keys, scoped rate limits, and namespaced idempotency keys (today the key is global, so two merchants using `order-123` collide).
+- [ ] Signed outbound webhooks (HMAC) with their own retry queue, so a merchant can be told the outcome.
+- [ ] Dead-letter queue with an operator view.
+- [ ] Versioned migrations (`golang-migrate`) with up/down checks in CI.
+- [ ] Secrets from a secret store instead of plain env vars.
+- [ ] Table-driven handler tests, property-based tests for routing/backoff, and `testcontainers-go` for self-contained integration tests.
+
+---
+
+## License
+
+[MIT](./LICENSE) © 2026 Abeer Srivastava
