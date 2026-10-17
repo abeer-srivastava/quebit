@@ -20,16 +20,22 @@ const (
 	MaxRetry = 8
 )
 
+// Amount thresholds for queue routing.
+const (
+	CriticalAmountThreshold int64 = 10_000
+	LowAmountThreshold      int64 = 1_000
+)
+
 // QueueFor routes payments by amount:
 //
-//	>= 10,000 → critical (high concurrency share)
-//	<  1,000  → low
-//	otherwise → default
+//	>= CriticalAmountThreshold → critical (high concurrency share)
+//	<  LowAmountThreshold       → low
+//	otherwise                  → default
 func QueueFor(amount int64) string {
 	switch {
-	case amount >= 10_000:
+	case amount >= CriticalAmountThreshold:
 		return QueueCritical
-	case amount < 1_000:
+	case amount < LowAmountThreshold:
 		return QueueLow
 	default:
 		return QueueDefault

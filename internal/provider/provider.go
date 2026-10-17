@@ -42,10 +42,15 @@ type Client struct {
 	http    *http.Client
 }
 
+const (
+	defaultProviderTimeout = 10 * time.Second
+	maxProviderResponse    = 1024
+)
+
 func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: 10 * time.Second},
+		http:    &http.Client{Timeout: defaultProviderTimeout},
 	}
 }
 
@@ -70,7 +75,7 @@ func (c *Client) Charge(ctx context.Context, req ChargeRequest) (*ChargeResult, 
 	}
 	defer resp.Body.Close()
 
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderResponse))
 
 	if resp.StatusCode/100 != 2 {
 		return nil, &Error{StatusCode: resp.StatusCode, Body: string(b)}

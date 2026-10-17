@@ -148,13 +148,25 @@ func (s *Service) ProcessPayment(ctx context.Context, id uuid.UUID) error {
 	var perr *provider.Error
 	if errors.As(err, &perr) && !perr.Retryable() {
 		s.log.Warn("terminal provider error", "id", id, "err", err)
-		_ = s.store.MarkFailedFinal(ctx, id, err.Error())
+		if mErr := s.store.MarkFailedFinal(ctx, id, err.Error()); mErr != nil {
+			s.log.Error("failed to mark payment failed_final", "id", id, "err", mErr)
+		}
 		return &queue.TerminalError{Cause: err}
 	}
 
 	// Transient error — mark retrying for now, caller (queue handler) decides retry behavior
-	_ = s.store.MarkRetrying(ctx, id, err.Error())
+	if mErr := s.store.MarkRetrying(ctx, id, err.Error()); mErr != nil {
+		s.log.Error("failed to mark payment retrying", "id", id, "err", mErr)
+	}
 	return err
+}
+
+// MarkExhausted transitions a payment to failed_final once its retry budget is
+// used up. The queue handler calls this on the final failed attempt so the
+// payment does not remain stuck in "retrying" after Asynq archives the task.
+func (s *Service) MarkExhausted(ctx context.Context, id uuid.UUID, reason string) error {
+	s.log.Warn("retry budget exhausted, marking failed_final", "id", id, "reason", reason)
+	return s.store.MarkFailedFinal(ctx, id, reason)
 }
 
 // ErrNotRetryable is returned when trying to retry a payment that isn't in failed_final state.

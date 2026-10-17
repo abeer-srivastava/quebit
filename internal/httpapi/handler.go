@@ -12,6 +12,8 @@ import (
 	"github.com/abeer-srivastava/quebit/internal/service"
 )
 
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
 // Handler is a thin HTTP adapter that delegates business logic to service.Service.
 type Handler struct {
 	svc *service.Service
@@ -52,7 +54,7 @@ type RetryResponse struct {
 }
 
 func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB request body limit
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 
 	var req CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -60,25 +62,8 @@ func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
-	if req.IdempotencyKey == "" {
-		writeError(w, http.StatusUnprocessableEntity,
-			validationError("idempotency_key", "idempotency_key is required"))
-		return
-	}
-	if len(req.IdempotencyKey) > 255 {
-		writeError(w, http.StatusUnprocessableEntity,
-			validationError("idempotency_key", "idempotency_key must be at most 255 characters"))
-		return
-	}
-	if req.Amount <= 0 {
-		writeError(w, http.StatusUnprocessableEntity,
-			validationError("amount", "amount must be greater than 0"))
-		return
-	}
-	if req.Currency == "" {
-		writeError(w, http.StatusUnprocessableEntity,
-			validationError("currency", "currency is required"))
+	if apiErr := validateCreateRequest(req); apiErr != nil {
+		writeError(w, http.StatusUnprocessableEntity, apiErr)
 		return
 	}
 
@@ -153,4 +138,22 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
+}
+
+// validateCreateRequest checks the fields of a create payment request and
+// returns the first validation error encountered, or nil when valid.
+func validateCreateRequest(req CreateRequest) *APIError {
+	if req.IdempotencyKey == "" {
+		return validationError("idempotency_key", "idempotency_key is required")
+	}
+	if len(req.IdempotencyKey) > 255 {
+		return validationError("idempotency_key", "idempotency_key must be at most 255 characters")
+	}
+	if req.Amount <= 0 {
+		return validationError("amount", "amount must be greater than 0")
+	}
+	if req.Currency == "" {
+		return validationError("currency", "currency is required")
+	}
+	return nil
 }
