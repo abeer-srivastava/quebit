@@ -25,3 +25,9 @@ type Repository interface {
 type StaleFinder interface {
 	FindStalePending(ctx context.Context, olderThanSeconds int) ([]StalePending, error)
 }
+
+// LeaseReclaimer returns payments whose processing lease has expired to the
+// pending state. Separated from Repository because only the reaper needs it.
+type LeaseReclaimer interface {
+	ReclaimExpiredLeases(ctx context.Context) ([]StalePending, error)
+}

@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,13 @@ var (
 	ErrAlreadyDone = errors.New("payment already in terminal state")
 )
 
+// DefaultProcessingLease is how long a worker may hold a payment in the
+// "processing" state before the reaper assumes the worker died and returns the
+// payment to "pending". It must comfortably exceed the provider timeout (10s)
+// plus the Asynq task timeout (30s) so a slow-but-alive worker is never
+// reclaimed underneath.
+const DefaultProcessingLease = 90 * time.Second
+
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -22,13 +30,14 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-const cols = `id, idempotency_key, amount, currency, status, attempts, last_error, provider_ref, created_at, updated_at`
+const cols = `id, idempotency_key, amount, currency, status, attempts, last_error, provider_ref, locked_until, created_at, updated_at`
 
 func scan(row pgx.Row) (*Payment, error) {
 	var p Payment
 	err := row.Scan(
 		&p.ID, &p.IdempotencyKey, &p.Amount, &p.Currency,
-		&p.Status, &p.Attempts, &p.LastError, &p.ProviderRef, &p.CreatedAt, &p.UpdatedAt,
+		&p.Status, &p.Attempts, &p.LastError, &p.ProviderRef,
+		&p.LockedUntil, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -78,16 +87,26 @@ func (s *Store) GetByKey(ctx context.Context, key string) (*Payment, error) {
 	return p, err
 }
 
-// Claim atomically moves a payment to "processing" and increments attempts.
-// Returns ErrAlreadyDone if the payment is already succeeded or failed_final,
-// preventing a duplicate task delivery from charging twice.
+// Claim atomically moves a payment from a claimable state ("pending" or
+// "retrying") to "processing", increments attempts, and takes a processing
+// lease. It returns ErrAlreadyDone for any other state.
+//
+// Restricting the transition to non-processing states is what makes the
+// exactly-one-charge invariant hold: if two workers receive the same task
+// concurrently, only the first can move the row out of pending/retrying; the
+// second sees no matching row and does nothing. A payment stuck in
+// "processing" because its worker died is recovered by the reaper, not by a
+// concurrent claim.
 func (s *Store) Claim(ctx context.Context, id uuid.UUID) (*Payment, error) {
 	row := s.pool.QueryRow(ctx, `
 		UPDATE payments
-		SET status = 'processing', attempts = attempts + 1, updated_at = now()
-		WHERE id = $1 AND status NOT IN ('succeeded', 'failed_final')
+		SET status = 'processing',
+		    attempts = attempts + 1,
+		    locked_until = now() + make_interval(secs => $2::double precision),
+		    updated_at = now()
+		WHERE id = $1 AND status IN ('pending', 'retrying')
 		RETURNING `+cols,
-		id,
+		id, DefaultProcessingLease.Seconds(),
 	)
 	p, err := scan(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -98,7 +117,7 @@ func (s *Store) Claim(ctx context.Context, id uuid.UUID) (*Payment, error) {
 
 func (s *Store) setStatus(ctx context.Context, id uuid.UUID, st Status, errMsg *string, providerRef *string) error {
 	_, err := s.pool.Exec(ctx,
-		`UPDATE payments SET status = $2, last_error = $3, provider_ref = COALESCE($4, provider_ref), updated_at = now() WHERE id = $1`,
+		`UPDATE payments SET status = $2, last_error = $3, provider_ref = COALESCE($4, provider_ref), locked_until = NULL, updated_at = now() WHERE id = $1`,
 		id, st, errMsg, providerRef,
 	)
 	return err

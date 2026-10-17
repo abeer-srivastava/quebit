@@ -25,6 +25,9 @@ type Payment struct {
 	Attempts       int       `json:"attempts"`
 	LastError      *string   `json:"last_error,omitempty"`
 	ProviderRef    *string   `json:"provider_ref,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// LockedUntil is the processing lease deadline. It is an internal
+	// coordination detail and is not exposed through the API.
+	LockedUntil *time.Time `json:"-"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }

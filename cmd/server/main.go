@@ -82,6 +82,9 @@ func main() {
 	// Stale pending sweeper
 	sweeper := queue.NewSweeper(store, queueCli, log)
 
+	// Expired processing-lease reaper
+	reaper := queue.NewReaper(store, queueCli, log)
+
 	// HTTP server
 	httpMux := http.NewServeMux()
 	httpHandler := httpapi.NewHandler(svc, log)
@@ -126,6 +129,10 @@ func main() {
 
 	g.Go(func() error {
 		return sweeper.Run(gctx)
+	})
+
+	g.Go(func() error {
+		return reaper.Run(gctx)
 	})
 
 	// Graceful shutdown goroutine
