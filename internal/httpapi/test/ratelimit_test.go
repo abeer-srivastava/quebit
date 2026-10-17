@@ -102,6 +102,73 @@ func TestRateLimiterMiddleware429(t *testing.T) {
 	}
 }
 
+func TestParseTrustedProxies(t *testing.T) {
+	nets, err := httpapi.ParseTrustedProxies("10.0.0.0/8, 192.168.1.1 , 2001:db8::/32")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(nets) != 3 {
+		t.Fatalf("expected 3 networks, got %d", len(nets))
+	}
+	if _, err := httpapi.ParseTrustedProxies("not-a-cidr"); err == nil {
+		t.Fatal("expected an error for malformed input")
+	}
+}
+
+// TestClientIPIgnoresSpoofedForwardedFor verifies that with no trusted proxies
+// configured, X-Forwarded-For cannot be used to evade the limiter.
+func TestClientIPIgnoresSpoofedForwardedFor(t *testing.T) {
+	rdb := setupMiniRedis(t)
+	rl := httpapi.NewRateLimiter(rdb, 1, time.Second)
+
+	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i, xff := range []string{"1.2.3.4", "5.6.7.8"} {
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.RemoteAddr = "203.0.113.7:5555"
+		req.Header.Set("X-Forwarded-For", xff)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if i == 0 && rec.Code != http.StatusOK {
+			t.Fatalf("first request: expected 200, got %d", rec.Code)
+		}
+		if i == 1 && rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("spoofed header was honoured: expected 429, got %d", rec.Code)
+		}
+	}
+}
+
+// TestClientIPHonoursForwardedForFromTrustedProxy verifies that headers are
+// believed only when the immediate peer is a configured trusted proxy.
+func TestClientIPHonoursForwardedForFromTrustedProxy(t *testing.T) {
+	rdb := setupMiniRedis(t)
+	trusted, err := httpapi.ParseTrustedProxies("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	rl := httpapi.NewRateLimiter(rdb, 1, time.Second, trusted...)
+
+	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Different forwarded clients share the same trusted peer but must get
+	// separate buckets.
+	for _, ip := range []string{"198.51.100.1", "198.51.100.2"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "10.0.0.5:4000"
+		req.Header.Set("X-Forwarded-For", ip)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("client %s: expected 200, got %d", ip, rec.Code)
+		}
+	}
+}
+
 func TestRateLimiterAtomicity(t *testing.T) {
 	// Verify the Lua script correctly counts: with limit=3, exactly 3 requests
 	// should be allowed, regardless of concurrent execution.

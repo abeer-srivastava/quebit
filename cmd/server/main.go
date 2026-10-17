@@ -93,7 +93,16 @@ func main() {
 	healthChecker := httpapi.NewHealthChecker(pool, rdb)
 	healthChecker.RegisterRoutes(httpMux)
 
-	rateLimiter := httpapi.NewRateLimiter(rdb, cfg.RateLimitRPS, time.Second)
+	trustedProxies, err := httpapi.ParseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		log.Error("invalid TRUSTED_PROXIES", "err", err)
+		os.Exit(1)
+	}
+	if len(trustedProxies) > 0 {
+		log.Info("trusting proxy headers from configured networks", "networks", cfg.TrustedProxies)
+	}
+
+	rateLimiter := httpapi.NewRateLimiter(rdb, cfg.RateLimitRPS, time.Second, trustedProxies...)
 
 	var handler http.Handler = httpMux
 	handler = rateLimiter.Middleware(handler)
@@ -168,6 +177,7 @@ type config struct {
 	ProviderAPIKey    string
 	WorkerConcurrency int
 	RateLimitRPS      int
+	TrustedProxies    string
 }
 
 func loadConfig() config {
@@ -179,6 +189,7 @@ func loadConfig() config {
 		ProviderAPIKey:    envOr("PROVIDER_API_KEY", ""),
 		WorkerConcurrency: envOrInt("WORKER_CONCURRENCY", 10),
 		RateLimitRPS:      envOrInt("RATE_LIMIT_RPS", 100),
+		TrustedProxies:    os.Getenv("TRUSTED_PROXIES"),
 	}
 }
 
