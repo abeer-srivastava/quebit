@@ -16,6 +16,18 @@ type chargeRequest struct {
 	Currency  string `json:"currency"`
 }
 
+// Sentinel amounts that let a caller force a specific provider outcome while
+// developing locally. They are far outside normal amounts and are documented in
+// the README ("Driving failure paths locally").
+const (
+	// TerminalAmount makes the provider return 422, which the worker treats as
+	// non-retryable, so the payment goes straight to failed_final.
+	TerminalAmount int64 = 999_999
+	// RetryableAmount makes the provider return 503, which the worker retries
+	// with backoff until the retry budget is exhausted.
+	RetryableAmount int64 = 888_888
+)
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -39,15 +51,18 @@ func main() {
 			return
 		}
 
-		// Allow callers to drive outcomes via currency sentinel values,
-		// useful for exercising retry / terminal paths locally.
-		switch req.Currency {
-		case "FAIL_TERMINAL":
+		// Allow callers to drive outcomes via sentinel amounts, useful for
+		// exercising the retry / terminal paths locally. Sentinels are on the
+		// amount because the API validates currency against the ISO 4217
+		// allowlist, so a sentinel currency would be rejected before it ever
+		// reached us.
+		switch req.Amount {
+		case TerminalAmount:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnprocessableEntity)
 			_, _ = w.Write([]byte(`{"error":"invalid card"}`))
 			return
-		case "FAIL_RETRYABLE":
+		case RetryableAmount:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"error":"temporarily down"}`))
