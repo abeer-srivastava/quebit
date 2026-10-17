@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -93,6 +94,7 @@ func main() {
 
 	var handler http.Handler = httpMux
 	handler = rateLimiter.Middleware(handler)
+	handler = httpapi.RecoverMiddleware(log, handler)
 	handler = httpapi.LoggerMiddleware(log, handler)
 
 	httpServer := &http.Server{
@@ -168,8 +170,8 @@ func loadConfig() config {
 		HTTPAddr:          envOr("HTTP_ADDR", ":8080"),
 		ProviderURL:       envOr("PROVIDER_URL", "http://localhost:9090"),
 		ProviderAPIKey:    envOr("PROVIDER_API_KEY", ""),
-		WorkerConcurrency: 10,
-		RateLimitRPS:      100,
+		WorkerConcurrency: envOrInt("WORKER_CONCURRENCY", 10),
+		RateLimitRPS:      envOrInt("RATE_LIMIT_RPS", 100),
 	}
 }
 
@@ -178,6 +180,20 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envOrInt returns the integer value of the environment variable, falling back
+// to fallback when it is unset, not a number, or not positive.
+func envOrInt(key string, fallback int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 func setupLogger() *slog.Logger {

@@ -24,6 +24,9 @@ type TaskReplayer interface {
 // Implementations: *service.Service.
 type Processor interface {
 	ProcessPayment(ctx context.Context, id uuid.UUID) error
+	// MarkExhausted transitions a payment to failed_final once its retry
+	// budget is used up, so it does not remain in "retrying" forever.
+	MarkExhausted(ctx context.Context, id uuid.UUID, reason string) error
 }
 
 // TerminalError wraps a provider error that should not be retried by Asynq.
