@@ -32,8 +32,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 type CreateRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
-	Amount         int64  `json:"amount"`
-	Currency       string `json:"currency"`
+	// Amount is in the currency's minor unit (e.g. cents): 12.34 USD is 1234.
+	Amount   int64  `json:"amount"`
+	Currency string `json:"currency"`
 }
 
 // CreateResponse wraps the payment with metadata about what happened.
@@ -61,6 +62,7 @@ func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, ErrInvalidJSON)
 		return
 	}
+	req.Currency = payment.NormalizeCurrency(req.Currency)
 
 	if apiErr := validateCreateRequest(req); apiErr != nil {
 		writeError(w, http.StatusUnprocessableEntity, apiErr)
@@ -159,6 +161,9 @@ func validateCreateRequest(req CreateRequest) *APIError {
 	}
 	if req.Currency == "" {
 		return validationError("currency", "currency is required")
+	}
+	if !payment.IsSupportedCurrency(req.Currency) {
+		return validationError("currency", "unsupported currency")
 	}
 	return nil
 }

@@ -162,6 +162,30 @@ func TestCreatePaymentIdempotencyMismatch(t *testing.T) {
 	}
 }
 
+func TestCreatePaymentNormalisesCurrency(t *testing.T) {
+	h, store := setupHandler(t)
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	body := `{"idempotency_key":"api-test-lower","amount":100,"currency":"usd"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/payments", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpapi.CreateResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	t.Cleanup(func() { store.Delete(context.Background(), resp.Payment.ID) })
+
+	if resp.Payment.Currency != "USD" {
+		t.Fatalf("expected currency normalised to USD, got %q", resp.Payment.Currency)
+	}
+}
+
 func TestCreatePaymentValidation(t *testing.T) {
 	h, _ := setupHandler(t)
 
@@ -176,6 +200,7 @@ func TestCreatePaymentValidation(t *testing.T) {
 		{"empty body", `{}`, http.StatusUnprocessableEntity},
 		{"missing amount", `{"idempotency_key":"k","currency":"USD"}`, http.StatusUnprocessableEntity},
 		{"negative amount", `{"idempotency_key":"k","amount":-1,"currency":"USD"}`, http.StatusUnprocessableEntity},
+		{"unsupported currency", `{"idempotency_key":"k","amount":100,"currency":"XYZ"}`, http.StatusUnprocessableEntity},
 		{"invalid json", `{bad`, http.StatusBadRequest},
 	}
 
