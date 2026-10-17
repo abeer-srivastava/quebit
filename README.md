@@ -475,7 +475,13 @@ The suite includes a **concurrency invariant test**: ten goroutines process the 
 
 ### Load test
 
-A small stdlib Go client `POST`s to `/v1/payments` with unique idempotency keys; the server, Postgres, Redis, and the mock provider all run on one machine (12th Gen Intel i5‑12500H, 16 threads, 15 GiB RAM, Linux 6.18), so these numbers characterize the pipeline rather than a production network. `RATE_LIMIT_RPS` was raised for the run so the per-IP limiter would not throttle the client.
+The load generator lives in [`cmd/loadgen`](./cmd/loadgen) and uses only the standard library; it `POST`s to `/v1/payments` with unique idempotency keys and reports throughput, status codes, and latency percentiles.
+
+```bash
+make load           # equivalent: go run ./cmd/loadgen -n 1000 -c 50
+```
+
+The server, Postgres, Redis, and the mock provider all ran on one machine (12th Gen Intel i5‑12500H, 16 threads, 15 GiB RAM, Linux 6.18), so these numbers characterize the pipeline rather than a production network. `RATE_LIMIT_RPS` was raised for the run so the per-IP limiter would not throttle the client.
 
 ```text
 requests:       1000

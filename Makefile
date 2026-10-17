@@ -1,4 +1,4 @@
-.PHONY: dev up down test lint build clean
+.PHONY: dev up down test lint build clean load
 
 # Start infrastructure (Postgres + Redis)
 up:
@@ -28,6 +28,10 @@ build:
 # Remove build artifacts
 clean:
 	rm -rf bin/
+
+# Run the load generator against a running server (requires dev + mockprovider)
+load:
+	go run ./cmd/loadgen -n 1000 -c 50
 
 # Run tests that don't need external services
 test-unit:
