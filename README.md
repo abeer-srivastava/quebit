@@ -116,7 +116,7 @@ Retrying a `422` can never succeed and wastes the retry budget, while giving up 
 | ✅ **No silent loss on enqueue failure** | If the DB insert succeeds but the enqueue fails, the sweeper re-enqueues the payment. |
 | ✅ **Stuck `processing` is recovered** | A crashed worker's payment is returned to `pending` once its 90 s lease expires. |
 | ⚠️ **Eventual, not immediate, enqueue** | There is a bounded window (up to the sweeper interval) between insert and enqueue when the enqueue fails. See *transactional outbox* in the [Roadmap](#roadmap). |
-| ⚠️ **Recovery is bounded, not instant** | A stuck payment is retried after its lease expires and the reaper runs, so recovery latency is measured in tens of seconds. |
+| ⚠️ **Recovery is bounded, not instant** | A stuck payment is retried after its lease expires and the reaper runs, so recovery latency is measured in tens of seconds. The sweeper drains stale `pending` rows at 100 per 30 s tick, so a large post-flush backlog clears in minutes, not seconds. |
 | ❌ **No ordering guarantee** | Payments are processed concurrently across queues; there is no FIFO guarantee between them. |
 | ❌ **Not exactly-once at the provider** | Correctness relies on the provider honoring `Idempotency-Key`. |
 
@@ -193,40 +193,44 @@ curl -s -X POST localhost:8080/v1/payments \
 ```json
 {
   "payment": {
-    "id": "b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11",
+    "id": "3df0e063-00ff-42d0-8fbe-7e58e0ade07a",
     "idempotency_key": "order-123",
     "amount": 5000,
     "currency": "USD",
     "status": "pending",
     "attempts": 0,
-    "created_at": "2026-01-01T12:00:00Z",
-    "updated_at": "2026-01-01T12:00:00Z"
+    "created_at": "2026-10-18T01:23:16.551361+05:30",
+    "updated_at": "2026-10-18T01:23:16.551361+05:30"
   },
   "created": true,
   "enqueued": true
 }
 ```
 
+`202 Accepted` — the payment is persisted and a task is on the queue. A worker picks it up within a second or so.
+
 ```bash
 # Look it up a moment later — a worker has charged the provider
-curl -s localhost:8080/v1/payments/b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11
+curl -s localhost:8080/v1/payments/3df0e063-00ff-42d0-8fbe-7e58e0ade07a
 ```
 
 ```json
 {
   "payment": {
-    "id": "b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11",
+    "id": "3df0e063-00ff-42d0-8fbe-7e58e0ade07a",
     "idempotency_key": "order-123",
     "amount": 5000,
     "currency": "USD",
     "status": "succeeded",
     "attempts": 1,
-    "provider_ref": "prov_b7c2f0f2-6f0f-4b7a-9c25-2c1d0f2a4e11",
-    "created_at": "2026-01-01T12:00:00Z",
-    "updated_at": "2026-01-01T12:00:00Z"
+    "provider_ref": "prov_3df0e063-00ff-42d0-8fbe-7e58e0ade07a",
+    "created_at": "2026-10-18T01:23:16.551361+05:30",
+    "updated_at": "2026-10-18T01:23:16.685365+05:30"
   }
 }
 ```
+
+The same request replayed with the same key returns the same row with `"created": false` and no re-enqueue; the same key with a different amount or currency is rejected with `409 Conflict`.
 
 A ready-made request collection lives in [`api.http`](./api.http).
 
@@ -253,6 +257,33 @@ The mock provider switches behavior on the **amount**:
 | anything else | `200` with a generated `provider_ref` |
 
 > Sentinels are amounts, not currencies, because the API validates `currency` against an ISO 4217 allowlist — a sentinel currency is rejected with `422` before a worker ever runs.
+
+Real responses (abridged):
+
+```jsonc
+// POST with amount 999999 → terminal 422 at the provider → failed_final, no retry
+{ "payment": { "id": "a601048a-…", "status": "failed_final", "attempts": 1,
+  "last_error": "provider returned 422: {\"error\":\"invalid card\"}" } }
+
+// POST with amount 888888 → retryable 503 → retrying (backoff pending)
+{ "payment": { "id": "b6e4ede5-…", "status": "retrying", "attempts": 1,
+  "last_error": "provider returned 503: {\"error\":\"temporarily down\"}" } }
+```
+
+```http
+POST /v1/payments/{id}/retry        → 202 {"status":"retrying"}
+POST /v1/payments  (reused key, different amount) → 409
+POST /v1/payments  (unknown currency "XYZ")       → 422
+GET  /v1/payments/not-a-uuid                      → 400
+GET  /v1/payments/11111111-…                      → 404
+```
+
+```jsonc
+// 409 Conflict
+{ "error": { "code": "conflict", "message": "idempotency key was reused with different request parameters" } }
+// 422 Unprocessable Entity
+{ "error": { "code": "validation_error", "message": "unsupported currency", "field": "currency" } }
+```
 
 ---
 
@@ -372,8 +403,34 @@ Every request counts against a per-IP sliding window (`RATE_LIMIT_RPS` per secon
 | Redis down (rate limiter) | Fails open — requests proceed |
 | `SIGINT` / `SIGTERM` | HTTP server drained, then the Asynq worker drained, within a 30 s window |
 
-<!-- TODO (after load/chaos testing): add a "Verified under failure" subsection with results, e.g.
-     "Killed Redis and Postgres mid-run at N req/s: 0 double charges, 0 payments stuck." -->
+### Verified under failure
+
+Two experiments were run against the local stack (Postgres 16 + Redis 7 in Docker, mock provider with 0–50 ms latency, `WORKER_CONCURRENCY=10`, `RATE_LIMIT_RPS` raised so the limiter would not throttle the client):
+
+**1. Redis data loss mid-run.** 2,000 payments were submitted in ~2.1 s, and a `redis-cli flushall` was issued 0.5 s in — wiping both the queue and the rate-limiter keys. Every payment whose task was dropped was later recovered and charged; **2,000 / 2,000 reached `succeeded`, none were lost**.
+
+The recovery, however, was **not** fast: 608 payments needed the sweeper, which drains at most 100 rows per 30 s tick, so the backlog took ~3.5 minutes to clear. Recovery *correctness* holds; recovery *throughput* is a known limitation (see [Roadmap](#roadmap)).
+
+```text
+status    | count
+----------+-------
+succeeded |  2000
+```
+
+**2. 100 concurrent identical requests.** 100 simultaneous `POST`s carrying the same idempotency key produced **one** payment row, one `provider_ref`, and `attempts = 1`. 99 requests got `200` (the replay) and exactly one got `202`.
+
+```text
+requests:       100   concurrency: 100
+status codes:   map[200:99 202:1]
+distinct ids:   1
+created=true:   1
+
+ rows | keys | provider_refs | total_attempts
+------+------+---------------+----------------
+    1 |    1 |             1 |              1
+```
+
+> The mock provider is stateless, so experiment 1 demonstrates no-loss recovery, not provider-side idempotency. The no-double-charge guarantee is the `Claim` guard plus the per-payment `Idempotency-Key`, exercised in experiment 2 and in the race-enabled test suite below.
 
 ---
 
@@ -402,8 +459,22 @@ DATABASE_URL=postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable \
 
 The suite includes a **concurrency invariant test**: ten goroutines process the same payment at once and the provider is charged exactly once (`internal/service/test`), plus store-level tests for the lease/reaper, the idempotency fingerprint, and the atomic retry transition.
 
-<!-- TODO: add a Benchmarks / Results section once load-test numbers exist (tool, req/s, p95 latency,
-     time to drain the queue, hardware). -->
+### Load test
+
+A small stdlib Go client `POST`s to `/v1/payments` with unique idempotency keys; the server, Postgres, Redis, and the mock provider all run on one machine (12th Gen Intel i5‑12500H, 16 threads, 15 GiB RAM, Linux 6.18), so these numbers characterize the pipeline rather than a production network. `RATE_LIMIT_RPS` was raised for the run so the per-IP limiter would not throttle the client.
+
+```text
+requests:       1000
+concurrency:    50
+elapsed:        1.19 s
+throughput:     840 req/s
+status codes:   map[202:1000]
+latency p50:    59.7 ms
+latency p95:    71.2 ms
+latency p99:    73.0 ms
+```
+
+The throughput is latency-bound (`50 concurrent / 59.7 ms ≈ 838 req/s`). Every request was accepted and persisted, with no `5xx` or `429`. See [Verified under failure](#verified-under-failure) for the recovery experiments.
 
 ---
 
@@ -435,9 +506,10 @@ migrations/               ordered SQL migrations (applied in order)
 
 ### Next
 
+- [ ] **Sweeper throughput** — the sweeper recovers at most 100 stale `pending` rows per 30 s tick, so a large backlog (e.g. after a Redis flush) takes minutes to drain. Drain in bounded batches with a monotonic cursor instead.
 - [ ] **Transactional outbox** — write the enqueue intent in the same transaction as the payment insert and relay it to Redis (`FOR UPDATE SKIP LOCKED`), closing the sweeper's eventual-consistency window. The sweeper then becomes a pure safety net.
 - [ ] **Circuit breaker** around the provider — fail fast during outages; with 8 retries and 10 workers, a provider outage otherwise hammers it.
-- [ ] **Load and chaos tests** — verify the "no double charge, nothing stuck" invariant while Redis/Postgres are killed mid-run, and publish the numbers here.
+- [x] **Load and chaos tests** — the numbers are in [Verified under failure](#verified-under-failure); formalizing them as a repeatable harness (k6) is still open.
 
 ### Ideas
 
