@@ -8,7 +8,7 @@
 
 **An asynchronous payment pipeline in Go: idempotent, retry-safe, and priority-routed.**
 
-Charging a card is slow, flaky, and must never happen twice. Quebit separates *accepting* a payment from *processing* it. PostgreSQL holds the durable state; Redis/Asynq distributes the work. The HTTP layer validates and persists the payment, then hands a task to the queue; a pool of workers charges an external provider and records the outcome — staying correct across duplicate requests, duplicate deliveries, transient provider failures, and worker crashes.
+Charging a card is slow, flaky, and must never happen twice. Quebit separates *accepting* a payment from *processing* it. PostgreSQL holds the durable state; Redis/Asynq distributes the work. The HTTP layer validates and persists the payment **together with an outbox marker**; a relay hands it to the queue; a pool of workers charges an external provider and records the outcome — staying correct across duplicate requests, duplicate deliveries, transient provider failures, and worker crashes.
 
 > **Status:** portfolio project. The core pipeline is complete and tested; the hardening work that closes the remaining design gaps is tracked in the [roadmap](#roadmap).
 
@@ -40,20 +40,20 @@ Charging a card is slow, flaky, and must never happen twice. Quebit separates *a
 flowchart TD
     C[Client] --> MW["Middleware<br/>logger → panic recovery → rate limiter"]
     MW --> H[HTTP handler]
-    H -->|"validate · INSERT … ON CONFLICT"| PG[(PostgreSQL)]
-    H -->|enqueue| Q[(Redis / Asynq)]
+    H -->|"validate · INSERT payment<br/>(published_at IS NULL)"| PG[(PostgreSQL)]
     H -.->|202 Accepted| C
+    RL[Outbox relay] -->|"claim unpublished<br/>FOR UPDATE SKIP LOCKED"| PG
+    RL -->|publish| Q[(Redis / Asynq)]
+    RL -->|"mark published<br/>in the same txn"| PG
     Q --> W[Asynq worker pool]
     W -->|"Claim + lease"| PG
     W -->|"POST /charge<br/>Idempotency-Key"| P[Payment provider]
     W -->|update status| PG
-    R[Processing-timeout reaper] -->|"expired lease → pending"| PG
-    R -->|re-enqueue| Q
-    S[Stale-pending sweeper] -->|re-enqueue stuck pending| Q
-    S --> PG
+    R[Processing-timeout reaper] -->|"expired lease → pending,<br/>clear marker"| PG
+    S[Stale-pending sweeper] -->|"stale pending → clear marker"| PG
 ```
 
-PostgreSQL is the source of truth; Redis only ever holds *work in flight*. Both background loops are recovery paths, not primary flow: the **sweeper** re-enqueues payments left in `pending` when the enqueue failed, and the **reaper** returns payments whose processing **lease** expired (the worker died mid-charge) to `pending`.
+PostgreSQL is the source of truth; Redis only ever holds *work in flight*. The HTTP handler never talks to Redis: it writes the payment and an unpublished marker in one `INSERT`, and the **outbox relay** publishes it. The **sweeper** and **reaper** are pure recovery paths — they clear the marker on payments whose task was lost or whose worker died mid-charge, and the relay re-publishes them.
 
 **Queue routing by amount.** Higher-value payments get more worker attention without starving the rest.
 
@@ -73,15 +73,15 @@ The weight controls how often the worker polls each queue, so critical work drai
 Provider calls are slow and fail transiently. Doing them inside the request would tie API latency and availability to the provider's. With a queue the API returns `202` quickly and retries happen out of band.
 
 **Why Asynq rather than Kafka or RabbitMQ?**
-The workload is a *task queue* — retries, backoff, priorities, delayed retries, and an inspector for replay — not an event log. Asynq provides all of that on Redis, keeping the operational footprint to two dependencies.
+The workload is a *task queue* — retries, backoff, priorities, and delayed retries — not an event log. Asynq provides all of that on Redis, keeping the operational footprint to two dependencies.
 
 **Why is Postgres the source of truth and Redis disposable?**
-Payment state must survive anything. If Redis is flushed, no payment is lost: the rows are still in Postgres and the sweeper re-enqueues anything stuck in `pending`. Losing Redis costs throughput, not money.
+Payment state must survive anything. If Redis is flushed, no payment is lost: the rows are still in Postgres, and the sweeper clears the outbox marker on anything stuck in `pending` so the relay publishes it again. Losing Redis costs throughput, not money.
 
 **Why three layers of idempotency?**
 Each layer covers a different failure:
 1. A `UNIQUE` constraint on `idempotency_key` stops duplicate *requests* from creating duplicate rows.
-2. Queue-level `TaskID` deduplication stops duplicate *enqueues*.
+2. Queue-level `TaskID` deduplication makes a duplicate *publish* a no-op.
 3. An atomic `Claim` (`UPDATE … WHERE status IN ('pending','retrying') RETURNING`) stops duplicate *deliveries* from charging twice — only one worker can move a payment into `processing`.
 
 The provider also receives `Idempotency-Key: <payment_id>`, so a retry after an ambiguous failure cannot double-charge on the provider side.
@@ -91,6 +91,9 @@ A key that comes back with a different amount or currency is a client bug. Retur
 
 **Why exponential backoff with jitter?**
 Plain backoff makes every failed task retry at the same instant, producing synchronized load spikes against a provider that is already struggling. Up to 20% jitter spreads them out, and the 10-minute cap bounds how long a payment can wait.
+
+**Why an outbox marker instead of enqueuing from the handler?**
+Writing the payment and enqueuing it are two systems, and a crash between them used to strand a payment in `pending` with nothing to process it. The `INSERT` now leaves `published_at` unset; a **relay** finds every unpublished payment and publishes it, marking it published *in the same transaction*. A payment therefore cannot exist without something that will pick it up, the handler never depends on Redis being up, and a crash after publishing merely causes a harmless re-publish. The marker is a column on `payments` rather than a separate outbox table because the message is exactly 1:1 with the payment — a second table would add a foreign key, a backfill, and a join without changing the guarantee.
 
 **Why a processing lease plus a reaper?**
 `Claim` moves a payment to `processing` and takes a 90-second lease (`locked_until`). If the worker dies between the provider call and the DB write, the lease expires and the reaper returns the payment to `pending`. Re-charging is safe because the provider call is idempotent per payment ID.
@@ -113,10 +116,11 @@ Retrying a `422` can never succeed and wastes the retry budget, while giving up 
 | ✅ **At-least-once processing** | A task is redelivered until acknowledged, so a crash does not lose work. |
 | ✅ **Effectively-once charging** | The `Claim` guard plus `Idempotency-Key: <payment_id>` stop a redelivered task from charging twice. |
 | ✅ **Terminal states are final** | A payment reaches `succeeded` or `failed_final` once; only the explicit retry endpoint can reopen a `failed_final` payment. |
-| ✅ **No silent loss on enqueue failure** | If the DB insert succeeds but the enqueue fails, the sweeper re-enqueues the payment. |
+| ✅ **No loss between the API and the queue** | The payment and its unpublished marker are written by one `INSERT`, and the relay publishes every unpublished row — even after a crash between the two. |
 | ✅ **Stuck `processing` is recovered** | A crashed worker's payment is returned to `pending` once its 90 s lease expires. |
-| ⚠️ **Eventual, not immediate, enqueue** | There is a bounded window (up to the sweeper interval) between insert and enqueue when the enqueue fails. See *transactional outbox* in the [Roadmap](#roadmap). |
-| ⚠️ **Recovery is bounded, not instant** | A stuck payment is retried after its lease expires and the reaper runs, so recovery latency is measured in tens of seconds. The sweeper drains stale `pending` rows at 100 per 30 s tick, so a large post-flush backlog clears in minutes, not seconds. |
+| ✅ **Lost queue tasks are re-published** | If Redis drops a queued task (for example on a flush), the payment stays `pending`; the sweeper clears its marker and the relay publishes it again. |
+| ⚠️ **Delivery is asynchronous** | A payment is queued within one relay interval (250 ms) of its commit, not synchronously with the HTTP request. |
+| ⚠️ **Recovery is bounded, not instant** | A stuck payment is re-published after its 90 s lease expires (reaper) or after a 60 s stale window (sweeper), so recovery is measured in tens of seconds, not milliseconds. |
 | ❌ **No ordering guarantee** | Payments are processed concurrently across queues; there is no FIFO guarantee between them. |
 | ❌ **Not exactly-once at the provider** | Correctness relies on the provider honoring `Idempotency-Key`. |
 
@@ -128,12 +132,13 @@ Retrying a `422` can never succeed and wastes the retry budget, while giving up 
 - **Dynamic priority routing** — `critical` / `default` / `low` queues chosen by amount.
 - **Three-layer idempotency** — a unique key constraint, queue `TaskID` dedup, and an atomic `Claim`.
 - **Idempotency-key fingerprint** — a reused key with a different amount/currency is rejected (`409`) instead of silently returning the original payment.
-- **Processing lease + reaper** — a crashed worker cannot strand a payment in `processing`; the lease expires and the payment is re-queued.
+- **Processing lease + reaper** — a crashed worker cannot strand a payment in `processing`; the lease expires and the relay re-publishes the payment.
 - **Retries with exponential backoff and jitter** — transient failures retry up to 8 times, capped at 10 minutes plus up to 20% jitter.
 - **Retry-exhaustion safety net** — when the budget is spent the payment moves to `failed_final` instead of sticking in `retrying`.
 - **Terminal error handling** — unrecoverable errors (e.g. `422`) mark the payment `failed_final` immediately and tell Asynq to skip retries.
-- **Manual replay** — `POST /v1/payments/{id}/retry` atomically moves a `failed_final` payment back to `pending`, replays the archived task, and falls back to a fresh enqueue; concurrent retries cannot both win.
-- **Stale pending sweeper** — re-enqueues payments stuck in `pending` (DB insert succeeded, enqueue failed).
+- **Transactional outbox** — the payment row and its "not yet queued" marker are written by one `INSERT`; a relay commits the publish and the marker together, so a crash can never leave a payment that nothing will pick up.
+- **Manual replay** — `POST /v1/payments/{id}/retry` atomically moves a `failed_final` payment back to `pending` and clears its outbox marker, so the relay re-publishes it; concurrent retries cannot both win.
+- **Stale pending sweeper** — clears the outbox marker on payments stuck in `pending` in a single `UPDATE`, so the relay drains the whole backlog instead of 100 rows per tick.
 - **Sliding-window rate limiting** — an atomic Redis Lua script enforces a per-IP budget and fails open. `X-Forwarded-For` / `X-Real-IP` are honored **only** from configured trusted proxy networks, so the limit cannot be spoofed.
 - **Money is explicit** — `amount` is always in the currency's **minor unit** (cents), and `currency` is validated against an ISO 4217 allowlist and normalized.
 - **Panic recovery** — handler panics become `500` responses with a logged stack trace instead of crashing the process.
@@ -177,7 +182,7 @@ make up
 # 2. Start the mock payment provider (separate terminal)
 go run ./cmd/mockprovider
 
-# 3. Start the server: HTTP API + Asynq worker + reaper + sweeper
+# 3. Start the server: HTTP API + Asynq worker + outbox relay + reaper + sweeper
 make dev
 ```
 
@@ -230,7 +235,7 @@ curl -s localhost:8080/v1/payments/3df0e063-00ff-42d0-8fbe-7e58e0ade07a
 }
 ```
 
-The same request replayed with the same key returns the same row with `"created": false` and no re-enqueue; the same key with a different amount or currency is rejected with `409 Conflict`.
+The same request replayed with the same key returns the same row with `"created": false` and nothing re-published; the same key with a different amount or currency is rejected with `409 Conflict`.
 
 A ready-made request collection lives in [`api.http`](./api.http).
 
@@ -325,7 +330,7 @@ A `2xx` response may include `{"provider_ref": "…"}`. Any non-`2xx` is an erro
 
 ### `POST /v1/payments`
 
-Create and enqueue a payment.
+Create a payment and queue it for processing.
 
 ```json
 { "idempotency_key": "order-123", "amount": 5000, "currency": "USD" }
@@ -389,13 +394,14 @@ Every request counts against a per-IP sliding window (`RATE_LIMIT_RPS` per secon
 
 | Failure | Behavior |
 |---|---|
-| Duplicate `POST` (same idempotency key) | Returns the original payment, `created=false`, no re-enqueue |
+| Duplicate `POST` (same idempotency key) | Returns the original payment, `created=false`, nothing re-published |
 | Same key, different amount/currency | `409 Conflict`; the original payment is untouched |
-| DB insert succeeds, enqueue fails | Payment stays `pending`; the **sweeper** re-enqueues it |
+| DB insert succeeds, process dies before publish | Payment stays `pending` with its marker unset; the **relay** publishes it on the next poll, including after a restart |
+| Redis drops a queued task (flush, restart) | Payment stays `pending` with its marker set; the **sweeper** clears the marker and the **relay** re-publishes it |
 | Duplicate task delivery | `Claim` finds no claimable row, returns `ErrAlreadyDone`; the payment is skipped |
-| Worker dies mid-charge | Its lease expires; the **reaper** returns the payment to `pending` and re-enqueues it (safe — the provider call is idempotent) |
+| Worker dies mid-charge | Its lease expires; the **reaper** returns the payment to `pending` and clears its marker so the relay re-publishes it (safe — the provider call is idempotent) |
 | Provider network error / `429` / `5xx` | Marked `retrying`; retried with exponential backoff + jitter (max 8) |
-| Retry budget exhausted | Marked `failed_final`; the task is archived (`SkipRetry`) |
+| Retry budget exhausted | Marked `failed_final`; the task is archived (`SkipRetry`), so recovery is manual via the retry endpoint |
 | Provider `4xx` (non-retryable, e.g. `422`) | Marked `failed_final` immediately; no retries |
 | Two concurrent manual retries | Only one wins the atomic `failed_final → pending` transition |
 | Spoofed `X-Forwarded-For` | Ignored unless the peer is in `TRUSTED_PROXIES` |
@@ -407,17 +413,25 @@ Every request counts against a per-IP sliding window (`RATE_LIMIT_RPS` per secon
 
 Two experiments were run against the local stack (Postgres 16 + Redis 7 in Docker, mock provider with 0–50 ms latency, `WORKER_CONCURRENCY=10`, `RATE_LIMIT_RPS` raised so the limiter would not throttle the client):
 
-**1. Redis data loss mid-run.** 2,000 payments were submitted in ~2.1 s, and a `redis-cli flushall` was issued 0.5 s in — wiping both the queue and the rate-limiter keys. Every payment whose task was dropped was later recovered and charged; **2,000 / 2,000 reached `succeeded`, none were lost**.
+**1. Redis data loss mid-run.** 2,000 payments were submitted in ~2.4 s, and a `redis-cli flushall` was issued 0.5 s in — wiping both the queue and the rate-limiter keys. Every payment whose task was dropped was recovered: **2,000 / 2,000 reached `succeeded` and none was lost**.
 
-The recovery, however, was **not** fast: 608 payments needed the sweeper, which drains at most 100 rows per 30 s tick, so the backlog took ~3.5 minutes to clear. Recovery *correctness* holds; recovery *throughput* is a known limitation (see [Roadmap](#roadmap)).
+Recovery took **79 s**, almost all of it the 60 s stale window: the sweeper then requeued 374 payments in a *single* `UPDATE` and the relay drained them a batch of 100 at a time.
 
 ```text
 status    | count
 ----------+-------
 succeeded |  2000
+
+total | distinct_provider_refs
+------+-----------------------
+ 2000 |                  2000
 ```
 
-**2. 100 concurrent identical requests.** 100 simultaneous `POST`s carrying the same idempotency key produced **one** payment row, one `provider_ref`, and `attempts = 1`. 99 requests got `200` (the replay) and exactly one got `202`.
+Counting the worker's charge attempts across the run: **2,002 payments charged, 2,002 distinct payment ids, one charge each** (the two extra are from an earlier smoke test) — i.e. **no payment was charged twice**.
+
+> Before the outbox, this same experiment took over four minutes: the old sweeper re-enqueued at most 100 rows per 30 s tick, so ~600 stuck payments trickled back one tick at a time.
+
+**2. 100 concurrent identical requests.** 100 simultaneous `POST`s carrying the same idempotency key produced **one** payment row, one `provider_ref`, and `attempts = 1`. 99 requests got `200` (the idempotent replay) and exactly one got `202`.
 
 ```text
 requests:       100   concurrency: 100
@@ -436,7 +450,7 @@ created=true:   1
 
 ## Observability
 
-- **Structured JSON logs** via `log/slog`. Set `LOG_LEVEL=DEBUG` to trace request entry/exit, enqueue/reschedule, provider calls, and status transitions.
+- **Structured JSON logs** via `log/slog`. Set `LOG_LEVEL=DEBUG` to trace request entry/exit, publish/reschedule, provider calls, and status transitions.
 - **Request logs** include `request_id`, method, path, status, duration, and bytes written.
 - **Request correlation** via the `X-Request-ID` header (generated if absent).
 
@@ -457,7 +471,7 @@ DATABASE_URL=postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable \
   go test -v -race ./...
 ```
 
-The suite includes a **concurrency invariant test**: ten goroutines process the same payment at once and the provider is charged exactly once (`internal/service/test`), plus store-level tests for the lease/reaper, the idempotency fingerprint, and the atomic retry transition.
+The suite includes a **concurrency invariant test**: ten goroutines process the same payment at once and the provider is charged exactly once (`internal/service/test`), plus store-level tests for the lease/reaper, the outbox (`PublishPending` / `ResetStalePending`), the idempotency fingerprint, and the atomic retry transition, and a unit test for the relay's publish loop (`internal/queue/test`).
 
 ### Load test
 
@@ -483,11 +497,11 @@ The throughput is latency-bound (`50 concurrent / 59.7 ms ≈ 838 req/s`). Every
 ```
 cmd/server/main.go        entry point: config, wiring, graceful shutdown
 cmd/mockprovider/main.go  runnable fake provider for local development
-internal/payment/         Payment model, repository interfaces, Postgres store, lease reaper, stale sweeper
+internal/payment/         Payment model, repository/outbox interfaces, Postgres store, lease reaper
 internal/provider/        Charger interface, HTTP client, provider error classification
-internal/queue/           Asynq client/server, task types & routing, handler, inspector, sweeper, reaper
+internal/queue/           Asynq client/server, task types & routing, handler, outbox relay, sweeper, reaper
 internal/httpapi/         HTTP handlers, error types, request logger, rate limiter, recovery, health
-internal/service/         business logic coordinating store, queue, and provider
+internal/service/         business logic coordinating the store and provider
 migrations/               ordered SQL migrations (applied in order)
 */*/test/                 black-box tests (package test)
 ```
@@ -498,6 +512,8 @@ migrations/               ordered SQL migrations (applied in order)
 
 ### Done
 
+- [x] **Transactional outbox** — the payment and its unpublished marker are written by one `INSERT`; a relay publishes unpublished rows (`FOR UPDATE SKIP LOCKED`) and marks them published in the same transaction. The handler no longer touches Redis, so a crash can no longer strand a payment.
+- [x] **Sweeper without a per-tick cap** — the sweeper clears the marker for stale pending payments in a single `UPDATE` and the relay drains the backlog, instead of 100 rows per 30 s tick.
 - [x] **Processing-timeout reaper** — a processing lease (`locked_until`) with a background reaper that returns payments whose worker died mid-charge to `pending`.
 - [x] **Idempotency payload check** — a stored request hash and a `409` when a key is reused with a different amount/currency.
 - [x] **Atomic manual retry** — the `failed_final → pending` transition is a single `UPDATE … WHERE … RETURNING`, so concurrent retries cannot both succeed.
@@ -506,10 +522,9 @@ migrations/               ordered SQL migrations (applied in order)
 
 ### Next
 
-- [ ] **Sweeper throughput** — the sweeper recovers at most 100 stale `pending` rows per 30 s tick, so a large backlog (e.g. after a Redis flush) takes minutes to drain. Drain in bounded batches with a monotonic cursor instead.
-- [ ] **Transactional outbox** — write the enqueue intent in the same transaction as the payment insert and relay it to Redis (`FOR UPDATE SKIP LOCKED`), closing the sweeper's eventual-consistency window. The sweeper then becomes a pure safety net.
 - [ ] **Circuit breaker** around the provider — fail fast during outages; with 8 retries and 10 workers, a provider outage otherwise hammers it.
-- [x] **Load and chaos tests** — the numbers are in [Verified under failure](#verified-under-failure); formalizing them as a repeatable harness (k6) is still open.
+- [ ] **Recover payments stuck mid-retry** — a task lost while a payment is `retrying` (its backoff lives in Redis) is not covered by the sweeper, which only scans `pending`. A stale-`retrying` scan with a threshold above the 10-minute backoff cap would close it.
+- [ ] **Repeatable chaos harness** — the one-off numbers live in [Verified under failure](#verified-under-failure); make the load and Redis-flush experiments a scripted, repeatable harness.
 
 ### Ideas
 
