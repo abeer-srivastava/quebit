@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 )
 
@@ -11,13 +10,6 @@ type APIError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	Field   string `json:"field,omitempty"`
-}
-
-func (e *APIError) Error() string {
-	if e.Field != "" {
-		return fmt.Sprintf("%s: %s (%s)", e.Code, e.Message, e.Field)
-	}
-	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
 // Common API errors

@@ -14,13 +14,13 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: payflow
-          POSTGRES_PASSWORD: payflow
-          POSTGRES_DB: payflow
+          POSTGRES_USER: quebit
+          POSTGRES_PASSWORD: quebit
+          POSTGRES_DB: quebit
         ports:
           - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U payflow"
+          --health-cmd="pg_isready -U quebit"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=5
@@ -38,7 +38,7 @@ jobs:
             psql "$DATABASE_URL" -f "$f"
           done
         env:
-          DATABASE_URL: postgres://payflow:payflow@localhost:5432/payflow?sslmode=disable
+          DATABASE_URL: postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable
 
       - name: Build
         run: go build ./...
@@ -49,4 +49,4 @@ jobs:
       - name: Test
         run: go test -v -race -count=1 ./...
         env:
-          DATABASE_URL: postgres://payflow:payflow@localhost:5432/payflow?sslmode=disable
+          DATABASE_URL: postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable
