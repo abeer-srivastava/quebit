@@ -68,6 +68,11 @@ func (h *Handler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.svc.CreatePayment(r.Context(), req.IdempotencyKey, req.Amount, req.Currency)
+	if errors.Is(err, payment.ErrIdempotencyMismatch) {
+		writeError(w, http.StatusConflict,
+			conflictError("idempotency key was reused with different request parameters"))
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to create payment", "err", err)
 		writeError(w, http.StatusInternalServerError, ErrInternal)

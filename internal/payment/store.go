@@ -30,14 +30,14 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-const cols = `id, idempotency_key, amount, currency, status, attempts, last_error, provider_ref, locked_until, created_at, updated_at`
+const cols = `id, idempotency_key, amount, currency, status, attempts, last_error, provider_ref, COALESCE(request_hash, '') AS request_hash, locked_until, created_at, updated_at`
 
 func scan(row pgx.Row) (*Payment, error) {
 	var p Payment
 	err := row.Scan(
 		&p.ID, &p.IdempotencyKey, &p.Amount, &p.Currency,
 		&p.Status, &p.Attempts, &p.LastError, &p.ProviderRef,
-		&p.LockedUntil, &p.CreatedAt, &p.UpdatedAt,
+		&p.RequestHash, &p.LockedUntil, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -45,15 +45,16 @@ func scan(row pgx.Row) (*Payment, error) {
 	return &p, nil
 }
 
-// Create inserts a new payment. If the idempotency key already exists,
-// it returns the existing row with created=false instead of an error.
+// Create inserts a new payment. If the idempotency key already exists, it
+// returns the existing row with created=false — unless the request parameters
+// differ from the original, in which case ErrIdempotencyMismatch is returned.
 func (s *Store) Create(ctx context.Context, p *Payment) (*Payment, bool, error) {
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO payments (id, idempotency_key, amount, currency, status)
-		VALUES ($1, $2, $3, $4, 'pending')
+		INSERT INTO payments (id, idempotency_key, amount, currency, status, request_hash)
+		VALUES ($1, $2, $3, $4, 'pending', $5)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING `+cols,
-		p.ID, p.IdempotencyKey, p.Amount, p.Currency,
+		p.ID, p.IdempotencyKey, p.Amount, p.Currency, p.RequestHash,
 	)
 
 	created, err := scan(row)
@@ -66,7 +67,15 @@ func (s *Store) Create(ctx context.Context, p *Payment) (*Payment, bool, error) 
 	}
 
 	existing, err := s.GetByKey(ctx, p.IdempotencyKey)
-	return existing, false, err
+	if err != nil {
+		return nil, false, err
+	}
+	// Legacy rows written before request_hash existed have an empty hash; treat
+	// them as compatible rather than rejecting every replay.
+	if existing.RequestHash != "" && p.RequestHash != "" && existing.RequestHash != p.RequestHash {
+		return existing, false, ErrIdempotencyMismatch
+	}
+	return existing, false, nil
 }
 
 func (s *Store) Get(ctx context.Context, id uuid.UUID) (*Payment, error) {

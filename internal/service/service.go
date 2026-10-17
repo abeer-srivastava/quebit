@@ -58,10 +58,12 @@ func (s *Service) CreatePayment(ctx context.Context, key string, amount int64, c
 		IdempotencyKey: key,
 		Amount:         amount,
 		Currency:       currency,
+		RequestHash:    payment.RequestHash(amount, currency),
 	}
 
 	created, isNew, err := s.store.Create(ctx, p)
 	if err != nil {
+		// Wrapped so the HTTP layer can detect key reuse (409) via errors.Is.
 		return nil, fmt.Errorf("create payment: %w", err)
 	}
 

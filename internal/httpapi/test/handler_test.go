@@ -133,6 +133,35 @@ func TestCreatePaymentIdempotent(t *testing.T) {
 	})
 }
 
+func TestCreatePaymentIdempotencyMismatch(t *testing.T) {
+	h, store := setupHandler(t)
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	body := `{"idempotency_key":"api-test-mismatch","amount":1000,"currency":"USD"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/payments", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp httpapi.CreateResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	t.Cleanup(func() { store.Delete(context.Background(), resp.Payment.ID) })
+
+	// Reusing the key with a different amount is a client bug → 409.
+	body2 := `{"idempotency_key":"api-test-mismatch","amount":2000,"currency":"USD"}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/payments", bytes.NewBufferString(body2))
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestCreatePaymentValidation(t *testing.T) {
 	h, _ := setupHandler(t)
 
