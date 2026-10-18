@@ -528,38 +528,6 @@ migrations/               ordered SQL migrations (applied in order)
 
 ---
 
-## Roadmap
-
-### Done
-
-- [x] **Transactional outbox** — the payment and its unpublished marker are written by one `INSERT`; a relay publishes unpublished rows (`FOR UPDATE SKIP LOCKED`) and marks them published in the same transaction. The handler no longer touches Redis, so a crash can no longer strand a payment.
-- [x] **Sweeper without a per-tick cap** — the sweeper clears the marker for stale pending payments in a single `UPDATE` and the relay drains the backlog, instead of 100 rows per 30 s tick.
-- [x] **Processing-timeout reaper** — a processing lease (`locked_until`) with a background reaper that returns payments whose worker died mid-charge to `pending`.
-- [x] **Idempotency payload check** — a stored request hash and a `409` when a key is reused with a different amount/currency.
-- [x] **Atomic manual retry** — the `failed_final → pending` transition is a single `UPDATE … WHERE … RETURNING`, so concurrent retries cannot both succeed.
-- [x] **Trusted-proxy handling** — `X-Forwarded-For` / `X-Real-IP` are honored only from configured proxy CIDRs.
-- [x] **ISO 4217 currency validation** and `amount` documented as minor units.
-
-### Next
-
-- [ ] **Circuit breaker** around the provider — fail fast during outages; with 8 retries and 10 workers, a provider outage otherwise hammers it.
-- [ ] **Recover payments stuck mid-retry** — a task lost while a payment is `retrying` (its backoff lives in Redis) is not covered by the sweeper, which only scans `pending`. A stale-`retrying` scan with a threshold above the 10-minute backoff cap would close it.
-- [ ] **Repeatable chaos harness** — the one-off numbers live in [Verified under failure](#verified-under-failure); make the load and Redis-flush experiments a scripted, repeatable harness.
-
-### Ideas
-
-- [ ] Prometheus metrics — queue depth (via the Asynq Inspector), payments by terminal status, provider latency histogram.
-- [ ] `/livez` (process) vs `/readyz` (DB + Redis) split.
-- [ ] OpenTelemetry tracing across HTTP, Asynq tasks, and provider calls.
-- [ ] Per-merchant API keys, scoped rate limits, and namespaced idempotency keys (today the key is global, so two merchants using `order-123` collide).
-- [ ] Signed outbound webhooks (HMAC) with their own retry queue, so a merchant can be told the outcome.
-- [ ] Dead-letter queue with an operator view.
-- [ ] Versioned migrations (`golang-migrate`) with up/down checks in CI.
-- [ ] Secrets from a secret store instead of plain env vars.
-- [ ] Table-driven handler tests, property-based tests for routing/backoff, and `testcontainers-go` for self-contained integration tests.
-
----
-
 ## License
 
 [MIT](./LICENSE) © 2026 Abeer Srivastava
