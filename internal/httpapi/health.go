@@ -10,12 +10,15 @@ import (
 )
 
 type HealthChecker struct {
-	pool *pgxpool.Pool
-	rdb  *redis.Client
+	pool    *pgxpool.Pool
+	rdb     *redis.Client
+	timeout time.Duration
 }
 
-func NewHealthChecker(pool *pgxpool.Pool, rdb *redis.Client) *HealthChecker {
-	return &HealthChecker{pool: pool, rdb: rdb}
+// NewHealthChecker builds the /healthz handler. timeout bounds the
+// Postgres/Redis pings performed on each probe.
+func NewHealthChecker(pool *pgxpool.Pool, rdb *redis.Client, timeout time.Duration) *HealthChecker {
+	return &HealthChecker{pool: pool, rdb: rdb, timeout: timeout}
 }
 
 func (hc *HealthChecker) RegisterRoutes(mux *http.ServeMux) {
@@ -23,7 +26,7 @@ func (hc *HealthChecker) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (hc *HealthChecker) Health(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), hc.timeout)
 	defer cancel()
 
 	pgOK := hc.pool.Ping(ctx) == nil

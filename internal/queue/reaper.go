@@ -24,12 +24,24 @@ type Reaper struct {
 	log      *slog.Logger
 }
 
-func NewReaper(store payment.LeaseReclaimer, log *slog.Logger) *Reaper {
-	return &Reaper{
+// ReaperOption customizes a Reaper; unset fields keep the defaults above.
+type ReaperOption func(*Reaper)
+
+// WithReapInterval overrides how often the reaper reclaims expired leases.
+func WithReapInterval(d time.Duration) ReaperOption {
+	return func(r *Reaper) { r.interval = d }
+}
+
+func NewReaper(store payment.LeaseReclaimer, log *slog.Logger, opts ...ReaperOption) *Reaper {
+	r := &Reaper{
 		store:    store,
 		interval: 30 * time.Second,
 		log:      log,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Run starts the reap loop. It blocks until ctx is cancelled.

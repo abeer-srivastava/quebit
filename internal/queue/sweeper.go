@@ -21,13 +21,31 @@ type Sweeper struct {
 	log      *slog.Logger
 }
 
-func NewSweeper(store payment.OutboxResetter, log *slog.Logger) *Sweeper {
-	return &Sweeper{
+// SweeperOption customizes a Sweeper; unset fields keep the defaults above.
+type SweeperOption func(*Sweeper)
+
+// WithSweepInterval overrides how often the sweeper looks for stale pendings.
+func WithSweepInterval(d time.Duration) SweeperOption {
+	return func(s *Sweeper) { s.interval = d }
+}
+
+// WithSweepStaleAge overrides how long (in seconds) a payment may stay
+// pending before the sweeper treats it as lost.
+func WithSweepStaleAge(d time.Duration) SweeperOption {
+	return func(s *Sweeper) { s.staleAge = int(d.Seconds()) }
+}
+
+func NewSweeper(store payment.OutboxResetter, log *slog.Logger, opts ...SweeperOption) *Sweeper {
+	s := &Sweeper{
 		store:    store,
 		interval: 30 * time.Second,
 		staleAge: 60,
 		log:      log,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Run starts the sweep loop. It blocks until ctx is cancelled.

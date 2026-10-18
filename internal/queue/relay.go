@@ -30,16 +30,33 @@ type Relay struct {
 	log      *slog.Logger
 }
 
+// RelayOption customizes a Relay; unset fields keep the defaults above.
+type RelayOption func(*Relay)
+
+// WithRelayInterval overrides how often the relay polls the outbox.
+func WithRelayInterval(d time.Duration) RelayOption {
+	return func(r *Relay) { r.interval = d }
+}
+
+// WithRelayBatch overrides the max number of payments published per poll.
+func WithRelayBatch(n int) RelayOption {
+	return func(r *Relay) { r.batch = n }
+}
+
 // NewRelay polls quickly: the API answers 202 as soon as the row is committed,
 // so any delay here is added request latency.
-func NewRelay(store payment.OutboxRelay, client Enqueuer, log *slog.Logger) *Relay {
-	return &Relay{
+func NewRelay(store payment.OutboxRelay, client Enqueuer, log *slog.Logger, opts ...RelayOption) *Relay {
+	r := &Relay{
 		store:    store,
 		client:   client,
 		interval: 250 * time.Millisecond,
 		batch:    100,
 		log:      log,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Run starts the relay loop. It blocks until ctx is cancelled.

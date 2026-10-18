@@ -5,9 +5,6 @@
 //
 //	go run ./cmd/loadgen -n 1000 -c 50
 //	go run ./cmd/loadgen -n 100 -c 100 -same-key fixed-key   # idempotency race
-//
-// It has no dependencies beyond the standard library, and it deliberately does
-// not use the payment status endpoint — it measures the write path only.
 package main
 
 import (

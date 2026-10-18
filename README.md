@@ -308,6 +308,27 @@ All configuration is via environment variables. A `.env` file is loaded automati
 | `TRUSTED_PROXIES` | *(empty)* | Comma-separated CIDRs whose `X-Forwarded-For` / `X-Real-IP` headers are trusted for rate limiting. Empty means those headers are ignored. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN`, or `ERROR` |
 
+All of the above — plus the optional tuning knobs below — are loaded in one place: [`internal/config`](./internal/config/config.go). No other package reads the environment for operational settings.
+
+### Optional tuning
+
+These all have sensible defaults (matching previous hardcoded values) and only need to be set to deviate from them. Durations use Go syntax: `250ms`, `30s`, `10m`. Invalid or non-positive values fall back to the default.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HTTP_READ_TIMEOUT` | `10s` | Bound on reading a request (headers + body) |
+| `HTTP_WRITE_TIMEOUT` | `10s` | Bound on writing a response |
+| `HTTP_IDLE_TIMEOUT` | `60s` | Bound on an idle keep-alive connection |
+| `HTTP_SHUTDOWN_TIMEOUT` | `30s` | Graceful HTTP shutdown window |
+| `HEALTH_TIMEOUT` | `3s` | Postgres/Redis ping bound in `/healthz` |
+| `PROVIDER_TIMEOUT` | `10s` | Bound on a single provider `/charge` call |
+| `WORKER_SHUTDOWN_TIMEOUT` | `30s` | Asynq in-flight-task drain window on shutdown |
+| `OUTBOX_RELAY_INTERVAL` | `250ms` | How often the outbox relay polls for unpublished payments |
+| `OUTBOX_RELAY_BATCH` | `100` | Max payments published per relay poll |
+| `OUTBOX_SWEEP_INTERVAL` | `30s` | How often stale pending payments are swept |
+| `OUTBOX_SWEEP_STALE_AGE` | `60s` | How long a payment may stay pending before being re-queued |
+| `OUTBOX_REAP_INTERVAL` | `30s` | How often expired processing leases are reclaimed |
+
 `WORKER_CONCURRENCY` and `RATE_LIMIT_RPS` must be positive integers; invalid or missing values fall back to the defaults. A malformed `TRUSTED_PROXIES` value fails startup.
 
 > **Deploying behind a load balancer?** Set `TRUSTED_PROXIES` to the proxy's CIDR. Otherwise the rate limiter keys on the proxy's IP and all clients share one budget.

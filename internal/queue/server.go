@@ -7,7 +7,9 @@ import (
 	"github.com/hibiken/asynq"
 )
 
-func NewServer(opt asynq.RedisClientOpt, concurrency int) *asynq.Server {
+// NewServer builds the Asynq worker server. shutdownTimeout bounds how long
+// it waits for in-flight tasks when SIGINT/SIGTERM arrives.
+func NewServer(opt asynq.RedisClientOpt, concurrency int, shutdownTimeout time.Duration) *asynq.Server {
 	return asynq.NewServer(opt, asynq.Config{
 		Concurrency: concurrency,
 		// Weights control how often each queue is polled.
@@ -18,7 +20,7 @@ func NewServer(opt asynq.RedisClientOpt, concurrency int) *asynq.Server {
 			QueueLow:      1,
 		},
 		RetryDelayFunc:  exponentialBackoff,
-		ShutdownTimeout: 30 * time.Second,
+		ShutdownTimeout: shutdownTimeout,
 	})
 }
 

@@ -47,11 +47,23 @@ const (
 	maxProviderResponse    = 1024
 )
 
-func NewClient(baseURL string) *Client {
-	return &Client{
+// ClientOption customizes a Client; unset options keep the defaults above.
+type ClientOption func(*Client)
+
+// WithTimeout overrides the per-request HTTP timeout.
+func WithTimeout(d time.Duration) ClientOption {
+	return func(c *Client) { c.http.Timeout = d }
+}
+
+func NewClient(baseURL string, opts ...ClientOption) *Client {
+	c := &Client{
 		baseURL: baseURL,
 		http:    &http.Client{Timeout: defaultProviderTimeout},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Charge calls the external payment provider and returns a ChargeResult with the

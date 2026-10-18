@@ -3,12 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/abeer-srivastava/quebit/internal/config"
 	"github.com/abeer-srivastava/quebit/internal/httpapi"
 	"github.com/abeer-srivastava/quebit/internal/payment"
 	"github.com/abeer-srivastava/quebit/internal/provider"
@@ -29,16 +27,17 @@ func main() {
 	// Load .env file if present (ignore error if not found)
 	_ = godotenv.Load()
 
-	log := setupLogger()
+	// All runtime settings live in internal/config.
+	cfg := config.Load()
+	log := cfg.NewLogger()
 
-	cfg := loadConfig()
-	log.Info("starting quebit", "http_addr", cfg.HTTPAddr, "provider_url", cfg.ProviderURL)
+	log.Info("starting quebit", "http_addr", cfg.HTTP.Addr, "provider_url", cfg.Provider.URL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Postgres
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	pool, err := pgxpool.New(ctx, cfg.Database.URL)
 	if err != nil {
 		log.Error("failed to connect to postgres", "err", err)
 		os.Exit(1)
@@ -52,8 +51,8 @@ func main() {
 	log.Info("connected to postgres")
 
 	// Redis
-	redisOpt := asynq.RedisClientOpt{Addr: cfg.RedisAddr}
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	redisOpt := asynq.RedisClientOpt{Addr: cfg.Redis.Addr}
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Error("redis ping failed", "err", err)
 		os.Exit(1)
@@ -64,8 +63,8 @@ func main() {
 	// Dependencies
 	store := payment.NewStore(pool)
 
-	providerCli := provider.NewClient(cfg.ProviderURL)
-	providerCli.APIKey = cfg.ProviderAPIKey
+	providerCli := provider.NewClient(cfg.Provider.URL, provider.WithTimeout(cfg.Provider.Timeout))
+	providerCli.APIKey = cfg.Provider.APIKey
 
 	// The queue client is only used by the outbox relay; the HTTP path never
 	// enqueues directly.
@@ -76,38 +75,46 @@ func main() {
 	svc := service.New(store, providerCli, log)
 
 	// Asynq worker
-	asynqServer := queue.NewServer(redisOpt, cfg.WorkerConcurrency)
+	asynqServer := queue.NewServer(redisOpt, cfg.Worker.Concurrency, cfg.Worker.ShutdownTimeout)
 	mux := asynq.NewServeMux()
 	queueHandler := queue.NewHandler(svc, log)
 	queueHandler.Register(mux)
 
 	// Outbox relay — publishes persisted payments to the queue
-	relay := queue.NewRelay(store, queueCli, log)
+	relay := queue.NewRelay(store, queueCli, log,
+		queue.WithRelayInterval(cfg.Outbox.RelayInterval),
+		queue.WithRelayBatch(cfg.Outbox.RelayBatch),
+	)
 
 	// Stale pending sweeper — re-queues payments whose task was lost
-	sweeper := queue.NewSweeper(store, log)
+	sweeper := queue.NewSweeper(store, log,
+		queue.WithSweepInterval(cfg.Outbox.SweepInterval),
+		queue.WithSweepStaleAge(cfg.Outbox.SweepStaleAge),
+	)
 
 	// Expired processing-lease reaper
-	reaper := queue.NewReaper(store, log)
+	reaper := queue.NewReaper(store, log,
+		queue.WithReapInterval(cfg.Outbox.ReapInterval),
+	)
 
 	// HTTP server
 	httpMux := http.NewServeMux()
 	httpHandler := httpapi.NewHandler(svc, log)
 	httpHandler.RegisterRoutes(httpMux)
 
-	healthChecker := httpapi.NewHealthChecker(pool, rdb)
+	healthChecker := httpapi.NewHealthChecker(pool, rdb, cfg.HTTP.HealthTimeout)
 	healthChecker.RegisterRoutes(httpMux)
 
-	trustedProxies, err := httpapi.ParseTrustedProxies(cfg.TrustedProxies)
+	trustedProxies, err := httpapi.ParseTrustedProxies(cfg.HTTP.TrustedProxies)
 	if err != nil {
 		log.Error("invalid TRUSTED_PROXIES", "err", err)
 		os.Exit(1)
 	}
 	if len(trustedProxies) > 0 {
-		log.Info("trusting proxy headers from configured networks", "networks", cfg.TrustedProxies)
+		log.Info("trusting proxy headers from configured networks", "networks", cfg.HTTP.TrustedProxies)
 	}
 
-	rateLimiter := httpapi.NewRateLimiter(rdb, cfg.RateLimitRPS, time.Second, trustedProxies...)
+	rateLimiter := httpapi.NewRateLimiter(rdb, cfg.HTTP.RateLimitRPS, time.Second, trustedProxies...)
 
 	var handler http.Handler = httpMux
 	handler = rateLimiter.Middleware(handler)
@@ -115,11 +122,11 @@ func main() {
 	handler = httpapi.LoggerMiddleware(log, handler)
 
 	httpServer := &http.Server{
-		Addr:         cfg.HTTPAddr,
+		Addr:         cfg.HTTP.Addr,
 		Handler:      handler,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.HTTP.ReadTimeout,
+		WriteTimeout: cfg.HTTP.WriteTimeout,
+		IdleTimeout:  cfg.HTTP.IdleTimeout,
 	}
 
 	// Run everything with errgroup
@@ -134,7 +141,7 @@ func main() {
 	})
 
 	g.Go(func() error {
-		log.Info("http server starting", "addr", cfg.HTTPAddr)
+		log.Info("http server starting", "addr", cfg.HTTP.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			return fmt.Errorf("http server: %w", err)
 		}
@@ -158,7 +165,7 @@ func main() {
 		<-gctx.Done()
 		log.Info("shutting down...")
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
 		defer cancel()
 
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
@@ -176,66 +183,4 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("quebit stopped cleanly")
-}
-
-type config struct {
-	DatabaseURL       string
-	RedisAddr         string
-	HTTPAddr          string
-	ProviderURL       string
-	ProviderAPIKey    string
-	WorkerConcurrency int
-	RateLimitRPS      int
-	TrustedProxies    string
-}
-
-func loadConfig() config {
-	return config{
-		DatabaseURL:       envOr("DATABASE_URL", "postgres://quebit:quebit@localhost:5432/quebit?sslmode=disable"),
-		RedisAddr:         envOr("REDIS_ADDR", "localhost:6379"),
-		HTTPAddr:          envOr("HTTP_ADDR", ":8080"),
-		ProviderURL:       envOr("PROVIDER_URL", "http://localhost:9090"),
-		ProviderAPIKey:    envOr("PROVIDER_API_KEY", ""),
-		WorkerConcurrency: envOrInt("WORKER_CONCURRENCY", 10),
-		RateLimitRPS:      envOrInt("RATE_LIMIT_RPS", 100),
-		TrustedProxies:    os.Getenv("TRUSTED_PROXIES"),
-	}
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// envOrInt returns the integer value of the environment variable, falling back
-// to fallback when it is unset, not a number, or not positive.
-func envOrInt(key string, fallback int) int {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		return fallback
-	}
-	return n
-}
-
-func setupLogger() *slog.Logger {
-	var level slog.LevelVar
-	level.Set(slog.LevelInfo)
-
-	raw := strings.ToUpper(os.Getenv("LOG_LEVEL"))
-	switch raw {
-	case "DEBUG":
-		level.Set(slog.LevelDebug)
-	case "WARN":
-		level.Set(slog.LevelWarn)
-	case "ERROR":
-		level.Set(slog.LevelError)
-	}
-
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level}))
 }
