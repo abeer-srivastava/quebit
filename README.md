@@ -1,11 +1,5 @@
 # Quebit
 
-[![CI](https://github.com/abeer-srivastava/quebit/actions/workflows/ci.yml/badge.svg)](https://github.com/abeer-srivastava/quebit/actions/workflows/ci.yml)
-![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
-![Postgres](https://img.shields.io/badge/Postgres-source%20of%20truth-4169E1?logo=postgresql&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis%20%C2%B7%20Asynq-disposable%20queue-DC382D?logo=redis&logoColor=white)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-
 **An asynchronous payment pipeline in Go: idempotent, retry-safe, and priority-routed.**
 
 Charging a card is slow, flaky, and must never happen twice. Quebit separates *accepting* a payment from *processing* it. PostgreSQL holds the durable state; Redis/Asynq distributes the work. The HTTP layer validates and persists the payment **together with an outbox marker**; a relay hands it to the queue; a pool of workers charges an external provider and records the outcome — staying correct across duplicate requests, duplicate deliveries, transient provider failures, and worker crashes.
